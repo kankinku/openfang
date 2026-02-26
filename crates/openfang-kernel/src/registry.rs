@@ -160,6 +160,23 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's model AND provider together.
+    pub fn update_model_and_provider(
+        &self,
+        id: AgentId,
+        new_model: String,
+        new_provider: String,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.model.model = new_model;
+        entry.manifest.model.provider = new_provider;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's skill allowlist.
     pub fn update_skills(&self, id: AgentId, skills: Vec<String>) -> OpenFangResult<()> {
         let mut entry = self

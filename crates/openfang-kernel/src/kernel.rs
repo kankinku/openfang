@@ -2202,16 +2202,34 @@ impl OpenFangKernel {
 
     /// Switch an agent's model.
     pub fn set_agent_model(&self, agent_id: AgentId, model: &str) -> KernelResult<()> {
-        self.registry
-            .update_model(agent_id, model.to_string())
-            .map_err(KernelError::OpenFang)?;
+        // Resolve provider from model catalog so switching models also switches provider
+        let resolved_provider = self
+            .model_catalog
+            .read()
+            .ok()
+            .and_then(|catalog| {
+                catalog
+                    .find_model(model)
+                    .map(|entry| entry.provider.clone())
+            });
+
+        if let Some(provider) = resolved_provider {
+            self.registry
+                .update_model_and_provider(agent_id, model.to_string(), provider.clone())
+                .map_err(KernelError::OpenFang)?;
+            info!(agent_id = %agent_id, model = %model, provider = %provider, "Agent model+provider updated");
+        } else {
+            self.registry
+                .update_model(agent_id, model.to_string())
+                .map_err(KernelError::OpenFang)?;
+            info!(agent_id = %agent_id, model = %model, "Agent model updated");
+        }
 
         // Persist the updated entry
         if let Some(entry) = self.registry.get(agent_id) {
             let _ = self.memory.save_agent(&entry);
         }
 
-        info!(agent_id = %agent_id, model = %model, "Agent model updated");
         Ok(())
     }
 
