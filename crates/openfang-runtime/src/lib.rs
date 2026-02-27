@@ -7,6 +7,7 @@ pub mod a2a;
 pub mod agent_loop;
 pub mod apply_patch;
 pub mod audit;
+pub mod auth_profiles_store;
 pub mod auth_cooldown;
 pub mod browser;
 pub mod command_lane;

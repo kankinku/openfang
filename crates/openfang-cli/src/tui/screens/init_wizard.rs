@@ -988,6 +988,11 @@ complex_threshold = 500
 
 api_listen = "127.0.0.1:4200"
 
+[api_auth]
+mode = "token"
+token_env = "OPENFANG_API_TOKEN"
+password_env = "OPENFANG_API_PASSWORD"
+
 [default_model]
 provider = "{provider}"
 model = "{model}"

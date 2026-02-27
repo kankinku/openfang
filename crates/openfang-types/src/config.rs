@@ -919,6 +919,65 @@ impl Default for ThinkingConfig {
     }
 }
 
+/// API authentication mode for the HTTP/WebSocket gateway.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiAuthMode {
+    /// Token authentication (`Authorization: Bearer <token>`).
+    #[default]
+    Token,
+    /// Password authentication (`x-openfang-password: <password>`).
+    Password,
+    /// Trust proxy headers from explicitly allowed proxy IPs.
+    TrustedProxy,
+    /// Disable remote auth and allow localhost-only access.
+    None,
+}
+
+/// Trusted-proxy authentication configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiTrustedProxyConfig {
+    /// Header containing upstream authenticated username.
+    pub user_header: String,
+    /// Proxy source IP allowlist (string IPs, e.g. "127.0.0.1").
+    pub trusted_ips: Vec<String>,
+}
+
+impl Default for ApiTrustedProxyConfig {
+    fn default() -> Self {
+        Self {
+            user_header: "x-openfang-user".to_string(),
+            trusted_ips: Vec::new(),
+        }
+    }
+}
+
+/// API auth configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiAuthConfig {
+    /// Authentication mode.
+    pub mode: ApiAuthMode,
+    /// Env var holding API token when `mode = "token"`.
+    pub token_env: String,
+    /// Env var holding API password when `mode = "password"`.
+    pub password_env: String,
+    /// Trusted proxy mode settings.
+    pub trusted_proxy: ApiTrustedProxyConfig,
+}
+
+impl Default for ApiAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: ApiAuthMode::Token,
+            token_env: String::new(),
+            password_env: String::new(),
+            trusted_proxy: ApiTrustedProxyConfig::default(),
+        }
+    }
+}
+
 /// Top-level kernel configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -946,6 +1005,9 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// Structured API auth settings (mode + env refs).
+    #[serde(default)]
+    pub api_auth: ApiAuthConfig,
     /// Kernel operating mode (stable, default, dev).
     #[serde(default)]
     pub mode: KernelMode,
@@ -1157,6 +1219,7 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            api_auth: ApiAuthConfig::default(),
             mode: KernelMode::default(),
             language: "en".to_string(),
             users: Vec::new(),
@@ -1222,6 +1285,7 @@ impl std::fmt::Debug for KernelConfig {
                     "<redacted>"
                 },
             )
+            .field("api_auth_mode", &self.api_auth.mode)
             .field("mode", &self.mode)
             .field("language", &self.language)
             .field("users", &format!("{} user(s)", self.users.len()))
@@ -2708,6 +2772,47 @@ impl KernelConfig {
     pub fn validate(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
+        match self.api_auth.mode {
+            ApiAuthMode::Token => {
+                let has_legacy = !self.api_key.trim().is_empty();
+                let token_env = self.api_auth.token_env.trim();
+                let has_env = !token_env.is_empty()
+                    && !std::env::var(token_env).unwrap_or_default().trim().is_empty();
+                if !has_legacy && !token_env.is_empty() && !has_env {
+                    warnings.push(format!(
+                        "API auth mode=token but neither legacy api_key nor {} is set (remote requests will be localhost-only)",
+                        token_env
+                    ));
+                }
+            }
+            ApiAuthMode::Password => {
+                let password_env = self.api_auth.password_env.trim();
+                let has_env = !password_env.is_empty()
+                    && !std::env::var(password_env)
+                        .unwrap_or_default()
+                        .trim()
+                        .is_empty();
+                if !has_env {
+                    warnings.push(format!(
+                        "API auth mode=password but {} is not set (remote requests will be localhost-only)",
+                        if password_env.is_empty() {
+                            "<empty password_env>"
+                        } else {
+                            password_env
+                        }
+                    ));
+                }
+            }
+            ApiAuthMode::TrustedProxy => {
+                if self.api_auth.trusted_proxy.trusted_ips.is_empty() {
+                    warnings.push(
+                        "API auth mode=trusted_proxy but api_auth.trusted_proxy.trusted_ips is empty".to_string(),
+                    );
+                }
+            }
+            ApiAuthMode::None => {}
+        }
+
         if let Some(ref tg) = self.channels.telegram {
             if std::env::var(&tg.bot_token_env)
                 .unwrap_or_default()
@@ -3214,7 +3319,13 @@ mod tests {
 
     #[test]
     fn test_validate_no_channels() {
-        let config = KernelConfig::default();
+        let config = KernelConfig {
+            api_auth: ApiAuthConfig {
+                mode: ApiAuthMode::None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let warnings = config.validate();
         assert!(warnings.is_empty());
     }
@@ -3267,6 +3378,7 @@ mod tests {
     #[test]
     fn test_validate_missing_env_vars() {
         let mut config = KernelConfig::default();
+        config.api_auth.mode = ApiAuthMode::None;
         config.channels.discord = Some(DiscordConfig {
             bot_token_env: "OPENFANG_TEST_NONEXISTENT_VAR_DC".to_string(),
             ..Default::default()

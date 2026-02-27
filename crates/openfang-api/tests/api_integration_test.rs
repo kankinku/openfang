@@ -12,7 +12,7 @@ use openfang_api::middleware;
 use openfang_api::routes::{self, AppState};
 use openfang_api::ws;
 use openfang_kernel::OpenFangKernel;
-use openfang_types::config::{DefaultModelConfig, KernelConfig};
+use openfang_types::config::{ApiAuthConfig, ApiAuthMode, DefaultModelConfig, KernelConfig};
 use std::sync::Arc;
 use std::time::Instant;
 use tower_http::cors::CorsLayer;
@@ -56,6 +56,10 @@ async fn start_test_server_with_provider(
     let config = KernelConfig {
         home_dir: tmp.path().to_path_buf(),
         data_dir: tmp.path().join("data"),
+        api_auth: ApiAuthConfig {
+            mode: ApiAuthMode::None,
+            ..Default::default()
+        },
         default_model: DefaultModelConfig {
             provider: provider.to_string(),
             model: model.to_string(),
@@ -682,6 +686,12 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         home_dir: tmp.path().to_path_buf(),
         data_dir: tmp.path().join("data"),
         api_key: api_key.to_string(),
+        api_auth: ApiAuthConfig {
+            mode: ApiAuthMode::Token,
+            // Keep tests deterministic regardless of host env vars.
+            token_env: String::new(),
+            ..Default::default()
+        },
         default_model: DefaultModelConfig {
             provider: "ollama".to_string(),
             model: "test-model".to_string(),
@@ -704,7 +714,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         shutdown_notify: Arc::new(tokio::sync::Notify::new()),
     });
 
-    let api_key_state = state.kernel.config.api_key.clone();
+    let api_auth_state = middleware::ApiAuthState::from_kernel_config(&state.kernel.config);
 
     let app = Router::new()
         .route("/api/health", axum::routing::get(routes::health))
@@ -748,7 +758,7 @@ async fn start_test_server_with_auth(api_key: &str) -> TestServer {
         )
         .route("/api/shutdown", axum::routing::post(routes::shutdown))
         .layer(axum::middleware::from_fn_with_state(
-            api_key_state,
+            api_auth_state,
             middleware::auth,
         ))
         .layer(axum::middleware::from_fn(middleware::request_logging))

@@ -396,7 +396,7 @@ enum ConfigCommands {
     },
     /// Save an API key to ~/.openfang/.env (prompts interactively).
     SetKey {
-        /// Provider name (groq, anthropic, openai, gemini, deepseek, etc.).
+        /// Provider name (groq, anthropic, openai, gemini, deepseek, api, etc.).
         provider: String,
     },
     /// Remove an API key from ~/.openfang/.env.
@@ -408,6 +408,27 @@ enum ConfigCommands {
     TestKey {
         /// Provider name.
         provider: String,
+    },
+    /// List auth profiles used for provider credential rotation.
+    ListAuthProfiles,
+    /// Upsert an auth profile mapping (provider/profile -> env var).
+    SetAuthProfile {
+        /// Provider name.
+        provider: String,
+        /// Profile name (e.g. default, backup).
+        profile: String,
+        /// Env var holding the credential.
+        env_var: String,
+        /// Profile kind (api_key, token, oauth).
+        #[arg(long, default_value = "api_key")]
+        kind: String,
+    },
+    /// Delete an auth profile mapping.
+    DeleteAuthProfile {
+        /// Provider name.
+        provider: String,
+        /// Profile name.
+        profile: String,
     },
 }
 
@@ -843,6 +864,16 @@ fn main() {
             ConfigCommands::SetKey { provider } => cmd_config_set_key(&provider),
             ConfigCommands::DeleteKey { provider } => cmd_config_delete_key(&provider),
             ConfigCommands::TestKey { provider } => cmd_config_test_key(&provider),
+            ConfigCommands::ListAuthProfiles => cmd_config_list_auth_profiles(),
+            ConfigCommands::SetAuthProfile {
+                provider,
+                profile,
+                env_var,
+                kind,
+            } => cmd_config_set_auth_profile(&provider, &profile, &env_var, &kind),
+            ConfigCommands::DeleteAuthProfile { provider, profile } => {
+                cmd_config_delete_auth_profile(&provider, &profile)
+            }
         },
         Some(Commands::Chat { agent }) => cmd_quick_chat(cli.config, agent),
         Some(Commands::Status { json }) => cmd_status(cli.config, json),
@@ -1243,6 +1274,11 @@ fn write_config_if_missing(
 # See https://github.com/RightNow-AI/openfang for documentation
 
 api_listen = "127.0.0.1:4200"
+
+[api_auth]
+mode = "token"
+token_env = "OPENFANG_API_TOKEN"
+password_env = "OPENFANG_API_PASSWORD"
 
 [default_model]
 provider = "{provider}"
@@ -3699,6 +3735,8 @@ fn cmd_channel_toggle(channel: &str, enable: bool) {
 /// Map a provider name to its conventional environment variable name.
 fn provider_to_env_var(provider: &str) -> String {
     match provider.to_lowercase().as_str() {
+        "api" | "gateway" | "openfang" => "OPENFANG_API_TOKEN".to_string(),
+        "api-password" | "gateway-password" => "OPENFANG_API_PASSWORD".to_string(),
         "groq" => "GROQ_API_KEY".to_string(),
         "anthropic" => "ANTHROPIC_API_KEY".to_string(),
         "openai" => "OPENAI_API_KEY".to_string(),
@@ -4111,11 +4149,22 @@ fn cmd_config_delete_key(provider: &str) {
 
 fn cmd_config_test_key(provider: &str) {
     let env_var = provider_to_env_var(provider);
+    let provider_norm = provider.to_lowercase();
 
     if std::env::var(&env_var).is_err() {
         ui::error(&format!("{env_var} not set"));
         ui::hint(&format!("Set it: openfang config set-key {provider}"));
         std::process::exit(1);
+    }
+
+    if provider_norm == "api"
+        || provider_norm == "gateway"
+        || provider_norm == "openfang"
+        || provider_norm == "api-password"
+        || provider_norm == "gateway-password"
+    {
+        println!("  {} is set.", env_var);
+        return;
     }
 
     print!("  Testing {provider} ({env_var})... ");
@@ -4126,6 +4175,67 @@ fn cmd_config_test_key(provider: &str) {
         println!("{}", "FAILED (401/403)".bright_red());
         ui::hint(&format!("Update key: openfang config set-key {provider}"));
         std::process::exit(1);
+    }
+}
+
+fn cmd_config_list_auth_profiles() {
+    let home = openfang_home();
+    let store = openfang_runtime::auth_profiles_store::load_store(&home);
+
+    if store.profiles.is_empty() {
+        println!("No auth profiles configured.");
+        println!(
+            "Add one: openfang config set-auth-profile <provider> <profile> <ENV_VAR> [--kind api_key]"
+        );
+        return;
+    }
+
+    println!("Auth profiles ({} total):", store.profiles.len());
+    let mut entries: Vec<_> = store.profiles.iter().collect();
+    entries.sort_by_key(|(id, _)| *id);
+    for (id, p) in entries {
+        let last_good = store
+            .last_good
+            .get(&p.provider)
+            .map(|lg| lg == id)
+            .unwrap_or(false);
+        println!(
+            "  - {}  provider={} kind={} env_var={} priority={}{}",
+            id,
+            p.provider,
+            p.kind,
+            p.env_var,
+            p.priority,
+            if last_good { " [last_good]" } else { "" }
+        );
+    }
+}
+
+fn cmd_config_set_auth_profile(provider: &str, profile: &str, env_var: &str, kind: &str) {
+    let home = openfang_home();
+    match openfang_runtime::auth_profiles_store::upsert_env_profile(
+        &home, provider, profile, env_var, kind,
+    ) {
+        Ok(profile_id) => ui::success(&format!("Saved auth profile: {profile_id} -> {env_var}")),
+        Err(e) => {
+            ui::error(&format!("Failed to save auth profile: {e}"));
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_config_delete_auth_profile(provider: &str, profile: &str) {
+    let home = openfang_home();
+    match openfang_runtime::auth_profiles_store::remove_profile(&home, provider, profile) {
+        Ok(true) => ui::success(&format!("Removed auth profile: {provider}:{profile}")),
+        Ok(false) => {
+            ui::error("Auth profile not found");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            ui::error(&format!("Failed to remove auth profile: {e}"));
+            std::process::exit(1);
+        }
     }
 }
 

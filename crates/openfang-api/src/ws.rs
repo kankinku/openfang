@@ -12,6 +12,7 @@
 //! Server → Client: `{"type":"silent_complete"}` (agent chose NO_REPLY)
 //! Server → Client: `{"type":"canvas","canvas_id":"...","html":"...","title":"..."}`
 
+use crate::middleware::ApiAuthState;
 use crate::routes::AppState;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
@@ -134,9 +135,8 @@ fn try_acquire_ws_slot(ip: IpAddr) -> Option<WsConnectionGuard> {
 
 /// GET /api/agents/:id/ws — Upgrade to WebSocket for real-time chat.
 ///
-/// SECURITY: Authenticates via Bearer token in Authorization header
-/// or `?token=` query parameter (for browser WebSocket clients that
-/// cannot set custom headers).
+/// SECURITY: Authenticates using configured API auth mode
+/// (token/password/trusted-proxy/localhost-only).
 pub async fn agent_ws(
     ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
@@ -145,26 +145,11 @@ pub async fn agent_ws(
     headers: axum::http::HeaderMap,
     uri: axum::http::Uri,
 ) -> impl IntoResponse {
-    // SECURITY: Authenticate WebSocket upgrades (bypasses middleware).
-    let api_key = &state.kernel.config.api_key;
-    if !api_key.is_empty() {
-        let header_auth = headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|token| token == api_key)
-            .unwrap_or(false);
-
-        let query_auth = uri
-            .query()
-            .and_then(|q| q.split('&').find_map(|pair| pair.strip_prefix("token=")))
-            .map(|token| token == api_key)
-            .unwrap_or(false);
-
-        if !header_auth && !query_auth {
-            warn!("WebSocket upgrade rejected: invalid auth");
-            return axum::http::StatusCode::UNAUTHORIZED.into_response();
-        }
+    // SECURITY: Authenticate WebSocket upgrades (bypasses HTTP middleware).
+    let auth_state = ApiAuthState::from_kernel_config(&state.kernel.config);
+    if !auth_state.authorize_ws_upgrade(&headers, &uri, addr.ip()) {
+        warn!("WebSocket upgrade rejected: invalid auth");
+        return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
 
     // SECURITY: Enforce per-IP WebSocket connection limit

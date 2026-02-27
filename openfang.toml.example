@@ -5,6 +5,15 @@
 # api_key = ""                               # Set to enable Bearer auth (recommended)
 # api_listen = "127.0.0.1:50051"             # HTTP API bind address (use 0.0.0.0 for public)
 
+# Structured API auth mode (preferred over legacy `api_key`)
+# [api_auth]
+# mode = "token"                             # token | password | trusted_proxy | none
+# token_env = "OPENFANG_API_TOKEN"           # Used when mode = token
+# password_env = "OPENFANG_API_PASSWORD"     # Used when mode = password
+# [api_auth.trusted_proxy]
+# user_header = "x-openfang-user"
+# trusted_ips = ["127.0.0.1"]
+
 [default_model]
 provider = "anthropic"                    # "anthropic", "gemini", "openai", "groq", "ollama", etc.
 model = "claude-sonnet-4-20250514"        # Model identifier

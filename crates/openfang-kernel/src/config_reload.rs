@@ -5,7 +5,7 @@
 //!
 //! **No-op** (informational only): log_level, language, mode.
 //!
-//! **Restart required**: api_listen, api_key, network, memory, default_model.
+//! **Restart required**: api_listen, api_key/api_auth, network, memory, default_model.
 
 use openfang_types::config::{KernelConfig, ReloadMode};
 use tracing::{info, warn};
@@ -139,6 +139,11 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
     if old.api_key != new.api_key {
         plan.restart_required = true;
         plan.restart_reasons.push("api_key changed".to_string());
+    }
+
+    if field_changed(&old.api_auth, &new.api_auth) {
+        plan.restart_required = true;
+        plan.restart_reasons.push("api_auth changed".to_string());
     }
 
     if old.network_enabled != new.network_enabled {
@@ -364,6 +369,16 @@ mod tests {
         let plan = build_reload_plan(&a, &b);
         assert!(plan.restart_required);
         assert!(plan.restart_reasons.iter().any(|r| r.contains("api_key")));
+    }
+
+    #[test]
+    fn test_api_auth_requires_restart() {
+        let a = default_cfg();
+        let mut b = default_cfg();
+        b.api_auth.mode = openfang_types::config::ApiAuthMode::Password;
+        let plan = build_reload_plan(&a, &b);
+        assert!(plan.restart_required);
+        assert!(plan.restart_reasons.iter().any(|r| r.contains("api_auth")));
     }
 
     #[test]

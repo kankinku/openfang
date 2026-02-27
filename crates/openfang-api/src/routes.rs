@@ -1,5 +1,6 @@
 //! Route handlers for the OpenFang API.
 
+use crate::middleware::ApiAuthState;
 use crate::types::*;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -4020,10 +4021,22 @@ pub async fn list_tools() -> impl IntoResponse {
 pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Return a redacted view of the kernel config
     let config = &state.kernel.config;
+    let auth_state = ApiAuthState::from_kernel_config(config);
     Json(serde_json::json!({
         "home_dir": config.home_dir.to_string_lossy(),
         "data_dir": config.data_dir.to_string_lossy(),
         "api_key": if config.api_key.is_empty() { "not set" } else { "***" },
+        "api_auth": {
+            "mode": auth_state.mode_label(),
+            "token_set": auth_state.token_set(),
+            "password_set": auth_state.password_set(),
+            "token_env": &config.api_auth.token_env,
+            "password_env": &config.api_auth.password_env,
+            "trusted_proxy": {
+                "user_header": &config.api_auth.trusted_proxy.user_header,
+                "trusted_ips_count": config.api_auth.trusted_proxy.trusted_ips.len()
+            }
+        },
         "default_model": {
             "provider": config.default_model.provider,
             "model": config.default_model.model,
@@ -4489,11 +4502,7 @@ pub async fn update_agent(
 
 /// GET /api/security — Security feature status for the dashboard.
 pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let auth_mode = if state.kernel.config.api_key.is_empty() {
-        "localhost_only"
-    } else {
-        "bearer_token"
-    };
+    let auth_state = ApiAuthState::from_kernel_config(&state.kernel.config);
 
     let audit_count = state.kernel.audit_log.len();
 
@@ -4527,8 +4536,10 @@ pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoRes
                 "default_fuel_limit": 1_000_000u64
             },
             "auth": {
-                "mode": auth_mode,
-                "api_key_set": !state.kernel.config.api_key.is_empty()
+                "mode": auth_state.mode_label(),
+                "token_set": auth_state.token_set(),
+                "password_set": auth_state.password_set(),
+                "auth_enabled": auth_state.auth_enabled()
             }
         },
         "monitoring": {
@@ -4835,6 +4846,10 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
     let mut providers: Vec<serde_json::Value> = Vec::with_capacity(provider_list.len());
 
     for p in &provider_list {
+        let auth_profile_count = openfang_runtime::auth_profiles_store::profile_count_for_provider(
+            &state.kernel.config.home_dir,
+            &p.id,
+        );
         let mut entry = serde_json::json!({
             "id": p.id,
             "display_name": p.display_name,
@@ -4843,6 +4858,7 @@ pub async fn list_providers(State(state): State<Arc<AppState>>) -> impl IntoResp
             "key_required": p.key_required,
             "api_key_env": p.api_key_env,
             "base_url": p.base_url,
+            "auth_profile_count": auth_profile_count,
         });
 
         // For local providers, add reachability info via health probe
@@ -5678,6 +5694,92 @@ pub async fn set_agent_mcp_servers(
 
 // ── Provider Key Management Endpoints ──────────────────────────────────
 
+/// GET /api/auth/profiles — List auth profile store (provider/env mappings).
+pub async fn list_auth_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store = openfang_runtime::auth_profiles_store::load_store(&state.kernel.config.home_dir);
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "version": store.version,
+            "profiles": store.profiles,
+            "order": store.order,
+            "last_good": store.last_good,
+            "usage_stats": store.usage_stats,
+        })),
+    )
+}
+
+/// PUT /api/auth/profiles/{provider}/{profile} — Upsert env-backed profile mapping.
+pub async fn upsert_auth_profile(
+    State(state): State<Arc<AppState>>,
+    Path((provider, profile)): Path<(String, String)>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let env_var = match body["env_var"].as_str() {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Missing or empty 'env_var' field"})),
+            )
+        }
+    };
+    let kind = body["kind"]
+        .as_str()
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("api_key");
+
+    match openfang_runtime::auth_profiles_store::upsert_env_profile(
+        &state.kernel.config.home_dir,
+        &provider,
+        &profile,
+        env_var,
+        kind,
+    ) {
+        Ok(profile_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "saved",
+                "profile_id": profile_id,
+                "provider": provider,
+                "profile": profile,
+                "env_var": env_var,
+                "kind": kind,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+/// DELETE /api/auth/profiles/{provider}/{profile} — Delete a profile mapping.
+pub async fn delete_auth_profile(
+    State(state): State<Arc<AppState>>,
+    Path((provider, profile)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match openfang_runtime::auth_profiles_store::remove_profile(
+        &state.kernel.config.home_dir,
+        &provider,
+        &profile,
+    ) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "removed", "provider": provider, "profile": profile})),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Profile not found"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
 /// POST /api/providers/{name}/key — Save an API key for a provider.
 ///
 /// SECURITY: Writes to `~/.openfang/secrets.env`, sets env var in process,
@@ -5743,6 +5845,21 @@ pub async fn set_provider_key(
     // Set env var in current process so detect_auth picks it up
     std::env::set_var(&env_var, &key);
 
+    // Keep auth profile store in sync (provider:default -> env var mapping).
+    if let Err(e) = openfang_runtime::auth_profiles_store::upsert_env_profile(
+        &state.kernel.config.home_dir,
+        &name,
+        "default",
+        &env_var,
+        "api_key",
+    ) {
+        tracing::warn!(
+            provider = %name,
+            error = %e,
+            "Failed to update auth profile store after provider key save"
+        );
+    }
+
     // Refresh auth detection
     state
         .kernel
@@ -5797,6 +5914,19 @@ pub async fn delete_provider_key(
 
     // Remove from process environment
     std::env::remove_var(&env_var);
+
+    // Remove provider default profile mapping (best-effort).
+    if let Err(e) = openfang_runtime::auth_profiles_store::remove_profile(
+        &state.kernel.config.home_dir,
+        &name,
+        "default",
+    ) {
+        tracing::warn!(
+            provider = %name,
+            error = %e,
+            "Failed to update auth profile store after provider key delete"
+        );
+    }
 
     // Refresh auth detection
     state

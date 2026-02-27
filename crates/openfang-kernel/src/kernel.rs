@@ -522,9 +522,24 @@ impl OpenFangKernel {
         );
 
         // Create LLM driver
+        let default_profile_env =
+            openfang_runtime::auth_profiles_store::resolve_env_var_for_provider(
+                &config.home_dir,
+                &config.default_model.provider,
+            );
+        let default_api_key = if let Some(ref resolved) = default_profile_env {
+            let _ = openfang_runtime::auth_profiles_store::touch_last_good(
+                &config.home_dir,
+                &config.default_model.provider,
+                &resolved.profile_id,
+            );
+            std::env::var(&resolved.env_var).ok()
+        } else {
+            std::env::var(&config.default_model.api_key_env).ok()
+        };
         let driver_config = DriverConfig {
             provider: config.default_model.provider.clone(),
-            api_key: std::env::var(&config.default_model.api_key_env).ok(),
+            api_key: default_api_key,
             base_url: config.default_model.base_url.clone(),
         };
         let primary_driver = drivers::create_driver(&driver_config)
@@ -3459,12 +3474,25 @@ impl OpenFangKernel {
     fn resolve_driver(&self, manifest: &AgentManifest) -> KernelResult<Arc<dyn LlmDriver>> {
         let agent_provider = &manifest.model.provider;
         let default_provider = &self.config.default_model.provider;
+        let store_profile =
+            openfang_runtime::auth_profiles_store::resolve_env_var_for_provider(
+                &self.config.home_dir,
+                agent_provider,
+            );
+        let provider_has_store_profiles = openfang_runtime::auth_profiles_store::provider_has_profiles(
+            &self.config.home_dir,
+            agent_provider,
+        );
 
         // If agent uses same provider as kernel default and has no custom overrides, reuse
         let has_custom_key = manifest.model.api_key_env.is_some();
         let has_custom_url = manifest.model.base_url.is_some();
 
-        let primary = if agent_provider == default_provider && !has_custom_key && !has_custom_url {
+        let primary = if agent_provider == default_provider
+            && !has_custom_key
+            && !has_custom_url
+            && !provider_has_store_profiles
+        {
             Arc::clone(&self.default_driver)
         } else {
             // Create a dedicated driver for this agent
@@ -3476,25 +3504,31 @@ impl OpenFangKernel {
                 .as_deref()
                 .unwrap_or(&self.config.default_model.api_key_env);
 
-            let api_key_env =
-                if let Some(profiles) = self.config.auth_profiles.get(agent_provider.as_str()) {
-                    if !profiles.is_empty() {
-                        // Pick highest-priority profile (lowest priority number)
-                        let mut sorted: Vec<_> = profiles.iter().collect();
-                        sorted.sort_by_key(|p| p.priority);
-                        let best = &sorted[0];
-                        // Use the profile's env var if the key exists, otherwise fall back
-                        if std::env::var(&best.api_key_env).is_ok() {
-                            best.api_key_env.clone()
-                        } else {
-                            default_key_env.to_string()
-                        }
+            let api_key_env = if let Some(ref selected) = store_profile {
+                let _ = openfang_runtime::auth_profiles_store::touch_last_good(
+                    &self.config.home_dir,
+                    agent_provider,
+                    &selected.profile_id,
+                );
+                selected.env_var.clone()
+            } else if let Some(profiles) = self.config.auth_profiles.get(agent_provider.as_str()) {
+                if !profiles.is_empty() {
+                    // Pick highest-priority profile (lowest priority number)
+                    let mut sorted: Vec<_> = profiles.iter().collect();
+                    sorted.sort_by_key(|p| p.priority);
+                    let best = &sorted[0];
+                    // Use the profile's env var if the key exists, otherwise fall back
+                    if std::env::var(&best.api_key_env).is_ok() {
+                        best.api_key_env.clone()
                     } else {
                         default_key_env.to_string()
                     }
                 } else {
                     default_key_env.to_string()
-                };
+                }
+            } else {
+                default_key_env.to_string()
+            };
 
             let driver_config = DriverConfig {
                 provider: agent_provider.clone(),

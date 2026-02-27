@@ -32,23 +32,29 @@ All responses include security headers (CSP, X-Frame-Options, X-Content-Type-Opt
 
 ## Authentication
 
-When an API key is configured in `config.toml`, all endpoints (except `/api/health` and `/`) require a Bearer token:
+OpenFang supports structured API auth via `[api_auth]` in `config.toml`:
 
-```
-Authorization: Bearer <your-api-key>
-```
+- `mode = "token"`: `Authorization: Bearer <token>` (or `?token=` for WS/SSE)
+- `mode = "password"`: `x-openfang-password: <password>` (or `?password=` for WS/SSE)
+- `mode = "trusted_proxy"`: requires trusted proxy IP + configured user header
+- `mode = "none"`: localhost-only access
 
-### Setting the API Key
+Legacy `api_key` is still supported and works as bearer token auth.
+
+### Setting API Auth
 
 Add to `~/.openfang/config.toml`:
 
 ```toml
-api_key = "your-secret-api-key"
+[api_auth]
+mode = "token"
+token_env = "OPENFANG_API_TOKEN"
+password_env = "OPENFANG_API_PASSWORD"
 ```
 
-### No Authentication
+### Localhost-only Mode
 
-If `api_key` is empty or not set, the API is accessible without authentication. CORS is restricted to localhost origins in this mode.
+If no valid remote auth credential is resolved, OpenFang falls back to localhost-only access. In this mode remote requests are rejected and CORS is restricted to localhost origins.
 
 ### Public Endpoints (No Auth Required)
 
@@ -771,7 +777,12 @@ Retrieve current kernel configuration (secrets are redacted).
   "default_provider": "groq",
   "default_model": "llama-3.3-70b-versatile",
   "listen_addr": "127.0.0.1:4200",
-  "api_key_set": true,
+  "api_key": "***",
+  "api_auth": {
+    "mode": "bearer_token",
+    "token_set": true,
+    "password_set": false
+  },
   "channels_configured": 2,
   "mcp_servers": 1
 }
@@ -936,27 +947,33 @@ List all known LLM providers and their authentication status. Auth status is det
 {
   "providers": [
     {
-      "name": "anthropic",
+      "id": "anthropic",
       "display_name": "Anthropic",
       "auth_status": "configured",
-      "env_var": "ANTHROPIC_API_KEY",
+      "api_key_env": "ANTHROPIC_API_KEY",
       "base_url": "https://api.anthropic.com",
-      "model_count": 3
+      "model_count": 3,
+      "key_required": true,
+      "auth_profile_count": 1
     },
     {
-      "name": "groq",
+      "id": "groq",
       "display_name": "Groq",
       "auth_status": "configured",
-      "env_var": "GROQ_API_KEY",
+      "api_key_env": "GROQ_API_KEY",
       "base_url": "https://api.groq.com/openai",
-      "model_count": 4
+      "model_count": 4,
+      "key_required": true,
+      "auth_profile_count": 0
     },
     {
-      "name": "ollama",
+      "id": "ollama",
       "display_name": "Ollama",
       "auth_status": "no_key_needed",
       "base_url": "http://localhost:11434",
-      "model_count": 0
+      "model_count": 0,
+      "key_required": false,
+      "auth_profile_count": 0
     }
   ],
   "total": 20
@@ -977,7 +994,7 @@ Set an API key for a provider. The key is stored securely and takes effect immed
 
 ```json
 {
-  "api_key": "sk-..."
+  "key": "sk-..."
 }
 ```
 
@@ -986,7 +1003,8 @@ Set an API key for a provider. The key is stored securely and takes effect immed
 ```json
 {
   "status": "configured",
-  "provider": "anthropic"
+  "provider": "anthropic",
+  "env_var": "ANTHROPIC_API_KEY"
 }
 ```
 
@@ -999,9 +1017,31 @@ Remove the API key for a provider. Agents using this provider will fall back to 
 ```json
 {
   "status": "removed",
-  "provider": "anthropic"
+  "provider": "anthropic",
+  "env_var": "ANTHROPIC_API_KEY"
 }
 ```
+
+### GET /api/auth/profiles
+
+List auth profiles used for provider credential routing/rotation.
+
+### PUT /api/auth/profiles/{provider}/{profile}
+
+Upsert profile mapping to an environment variable.
+
+**Request Body**:
+
+```json
+{
+  "env_var": "ANTHROPIC_API_KEY_BACKUP",
+  "kind": "api_key"
+}
+```
+
+### DELETE /api/auth/profiles/{provider}/{profile}
+
+Delete a provider profile mapping.
 
 ### POST /api/providers/{name}/test
 
@@ -2092,7 +2132,7 @@ All error responses use a consistent JSON format:
 | `200` | Success |
 | `201` | Created (spawn agent, create workflow, create trigger, install skill) |
 | `400` | Bad request (invalid UUID, missing required fields, malformed TOML/JSON) |
-| `401` | Unauthorized (missing or invalid `Authorization: Bearer` header) |
+| `401` | Unauthorized (missing/invalid auth header or token/password) |
 | `404` | Not found (agent, workflow, trigger, template, model, skill, or KV key does not exist) |
 | `429` | Too many requests (GCRA rate limit exceeded) |
 | `500` | Internal server error (agent loop failure, database error, driver error) |
@@ -2198,6 +2238,9 @@ The `Retry-After` header indicates the window duration in seconds.
 | POST | `/api/providers/{name}/key` | Set provider API key |
 | DELETE | `/api/providers/{name}/key` | Remove provider API key |
 | POST | `/api/providers/{name}/test` | Test provider connectivity |
+| GET | `/api/auth/profiles` | List provider auth profiles |
+| PUT | `/api/auth/profiles/{provider}/{profile}` | Upsert provider auth profile |
+| DELETE | `/api/auth/profiles/{provider}/{profile}` | Delete provider auth profile |
 | **Skills & Marketplace** | | |
 | GET | `/api/skills` | List installed skills (60 bundled) |
 | POST | `/api/skills/install` | Install skill |
