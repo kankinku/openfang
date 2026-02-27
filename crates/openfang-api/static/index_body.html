@@ -205,7 +205,7 @@
               <div class="flex justify-between items-center mb-2">
                 <div>
                   <div class="card-header" style="margin:0">Getting Started</div>
-                  <div class="text-xs text-dim" x-text="setupDoneCount + ' of 5 steps completed'"></div>
+                  <div class="text-xs text-dim" x-text="setupDoneCount + ' of ' + setupChecklist.length + ' steps completed'"></div>
                 </div>
                 <div class="flex gap-2">
                   <button class="btn btn-primary btn-sm" @click="location.hash='wizard'">Setup Wizard</button>
@@ -4013,7 +4013,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                 <div style="margin-top:8px">
                   <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
                     <span class="badge badge-info" style="min-width:20px;justify-content:center">1</span>
-                    <span style="font-size:12px">Connect an LLM provider (Anthropic, OpenAI, Gemini, etc.)</span>
+                    <span style="font-size:12px">Connect an LLM provider (Anthropic, OpenAI, Gemini, etc.) and secure API access</span>
                   </div>
                   <div style="display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--border)">
                     <span class="badge badge-info" style="min-width:20px;justify-content:center">2</span>
@@ -4042,7 +4042,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
             <div class="wizard-card">
               <h3 style="font-size:16px;font-weight:700;margin-bottom:4px">Connect an LLM Provider</h3>
               <p style="font-size:12px;color:var(--text-dim);margin-bottom:16px;line-height:1.6">
-                OpenFang needs at least one LLM provider to power your agents. Select a provider and enter your API key.
+                OpenFang needs at least one LLM provider to power your agents. Select a provider, enter your API key, and choose gateway auth mode.
               </p>
 
               <div class="info-card" x-show="hasConfiguredProvider" style="border-left-color:var(--success)">
@@ -4127,10 +4127,52 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                   </div>
                 </div>
               </template>
+
+              <div class="card" style="border-left:3px solid var(--info);margin-top:16px">
+                <div class="card-header">Gateway API Auth</div>
+                <div class="text-xs text-dim mb-3">Choose how remote API/WebSocket access is protected.</div>
+
+                <div class="form-group">
+                  <label>Auth Mode</label>
+                  <select class="form-select" x-model="apiAuthMode">
+                    <option value="token">Token (recommended)</option>
+                    <option value="password">Password header</option>
+                    <option value="none">Localhost only</option>
+                    <option value="trusted_proxy">Trusted proxy (advanced)</option>
+                  </select>
+                </div>
+
+                <div class="form-group" x-show="apiAuthNeedsSecret">
+                  <label x-text="apiAuthSecretLabel"></label>
+                  <div class="key-input-group">
+                    <input type="password" :placeholder="apiAuthSecretPlaceholder" x-model="apiAuthSecretInput" @keydown.enter="saveApiAuth()">
+                    <button class="btn btn-primary btn-sm" @click="saveApiAuth()" :disabled="savingApiAuth || !apiAuthSecretInput.trim()">
+                      <span x-show="!savingApiAuth">Save Auth</span>
+                      <span x-show="savingApiAuth" class="spinner" style="width:10px;height:10px;border-width:2px"></span>
+                    </button>
+                  </div>
+                </div>
+
+                <div class="form-group" x-show="!apiAuthNeedsSecret">
+                  <button class="btn btn-ghost btn-sm" @click="saveApiAuth()" :disabled="savingApiAuth">
+                    <span x-show="!savingApiAuth">Apply Auth Mode</span>
+                    <span x-show="savingApiAuth" class="spinner" style="width:10px;height:10px;border-width:2px"></span>
+                  </button>
+                </div>
+
+                <div class="text-xs text-dim mt-2" x-show="apiAuthMode === 'trusted_proxy'">
+                  Trusted proxy mode requires <code style="padding:1px 4px;border-radius:2px">api_auth.trusted_proxy.trusted_ips</code> in <code style="padding:1px 4px;border-radius:2px">~/.openfang/config.toml</code>.
+                </div>
+
+                <div class="mt-2">
+                  <span class="badge badge-muted" style="padding:6px 12px" x-text="'Current: ' + apiAuthStatusLabel"></span>
+                  <span class="badge badge-success" style="padding:6px 12px;margin-left:6px" x-show="apiAuthSaved">Updated</span>
+                </div>
+              </div>
             </div>
             <div class="wizard-nav">
               <button class="btn btn-ghost" @click="prevStep()">Back</button>
-              <button class="btn btn-primary" @click="nextStep()" :disabled="!canGoNext"><span x-text="hasConfiguredProvider || keySaved ? 'Next' : 'Skip'"></span></button>
+              <button class="btn btn-primary" @click="nextStep()" :disabled="!canGoNext">Next</button>
             </div>
           </div>
 
@@ -4290,6 +4332,13 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/path"]</pre>
                       <span x-show="setupSummary.provider" x-text="setupSummary.provider"></span>
                       <span x-show="!setupSummary.provider && hasConfiguredProvider" class="badge badge-success">Pre-configured</span>
                       <span x-show="!setupSummary.provider && !hasConfiguredProvider" class="badge badge-warn">Skipped</span>
+                    </span>
+                  </div>
+                  <div class="detail-row">
+                    <span class="detail-label">Gateway Auth</span>
+                    <span class="detail-value">
+                      <span x-show="setupSummary.auth" x-text="setupSummary.auth"></span>
+                      <span x-show="!setupSummary.auth" class="badge badge-muted">Not changed</span>
                     </span>
                   </div>
                   <div class="detail-row">

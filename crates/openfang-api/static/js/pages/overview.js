@@ -6,6 +6,7 @@ function overviewPage() {
     health: {},
     status: {},
     usageSummary: {},
+    config: {},
     recentAudit: [],
     channels: [],
     providers: [],
@@ -24,6 +25,7 @@ function overviewPage() {
           this.loadHealth(),
           this.loadStatus(),
           this.loadUsage(),
+          this.loadConfig(),
           this.loadAudit(),
           this.loadChannels(),
           this.loadProviders(),
@@ -46,6 +48,7 @@ function overviewPage() {
           this.loadHealth(),
           this.loadStatus(),
           this.loadUsage(),
+          this.loadConfig(),
           this.loadAudit(),
           this.loadChannels(),
           this.loadProviders(),
@@ -103,6 +106,12 @@ function overviewPage() {
       }
     },
 
+    async loadConfig() {
+      try {
+        this.config = await OpenFangAPI.get('/api/config');
+      } catch(e) { this.config = {}; }
+    },
+
     async loadAudit() {
       try {
         var data = await OpenFangAPI.get('/api/audit/recent?n=8');
@@ -150,6 +159,22 @@ function overviewPage() {
       return this.mcpServers.filter(function(s) { return s.status === 'connected'; });
     },
 
+    get gatewayAuthReady() {
+      var apiAuth = (this.config && this.config.api_auth) || {};
+      var resolvedMode = apiAuth.resolved_mode || apiAuth.mode || 'localhost_only';
+      var configuredMode = apiAuth.configured_mode;
+      if (!configuredMode) {
+        if (resolvedMode === 'bearer_token') configuredMode = 'token';
+        else if (resolvedMode === 'password') configuredMode = 'password';
+        else if (resolvedMode === 'trusted_proxy') configuredMode = 'trusted_proxy';
+        else configuredMode = 'none';
+      }
+      if (configuredMode === 'token') return !!apiAuth.token_set;
+      if (configuredMode === 'password') return !!apiAuth.password_set;
+      if (configuredMode === 'trusted_proxy') return true;
+      return !(resolvedMode === 'localhost_only' && !apiAuth.configured_mode);
+    },
+
     // Provider health badge color
     providerBadgeClass(p) {
       if (p.auth_status === 'configured') {
@@ -183,6 +208,7 @@ function overviewPage() {
     get setupChecklist() {
       return [
         { key: 'provider', label: 'Configure an LLM provider', done: this.configuredProviders.length > 0, action: '#settings' },
+        { key: 'gateway-auth', label: 'Set gateway API auth mode', done: this.gatewayAuthReady, action: '#wizard' },
         { key: 'agent', label: 'Create your first agent', done: (Alpine.store('app').agents || []).length > 0, action: '#agents' },
         { key: 'chat', label: 'Send your first message', done: localStorage.getItem('of-first-msg') === 'true', action: '#chat' },
         { key: 'channel', label: 'Connect a messaging channel', done: this.channels.length > 0, action: '#channels' },
@@ -192,7 +218,7 @@ function overviewPage() {
 
     get setupProgress() {
       var done = this.setupChecklist.filter(function(item) { return item.done; }).length;
-      return (done / 5) * 100;
+      return (done / this.setupChecklist.length) * 100;
     },
 
     get setupDoneCount() {

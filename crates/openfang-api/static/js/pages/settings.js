@@ -105,9 +105,9 @@ function settingsPage() {
         valueKey: 'wasm_sandbox'
       },
       {
-        name: 'Bearer Token Authentication', key: 'auth',
-        description: 'All non-health endpoints require Authorization: Bearer header. When no API key is configured, all requests are restricted to localhost only.',
-        configHint: 'Set api_key in ~/.openfang/config.toml for remote access. Empty = localhost only.',
+        name: 'Gateway API Authentication', key: 'auth',
+        description: 'Protect API/WebSocket access with token, password header, trusted proxy identity, or localhost-only mode.',
+        configHint: 'Configure [api_auth] in ~/.openfang/config.toml (mode + token_env/password_env).',
         valueKey: 'auth'
       }
     ],
@@ -449,7 +449,25 @@ function settingsPage() {
         case 'wasm_sandbox':
           return 'Fuel: ' + (val.fuel_metering ? 'ON' : 'OFF') + ' | Epoch: ' + (val.epoch_interruption ? 'ON' : 'OFF') + ' | Timeout: ' + (val.default_timeout_secs || 30) + 's';
         case 'auth':
-          return 'Mode: ' + (val.mode || 'unknown') + (val.api_key_set ? ' (key configured)' : ' (no key set)');
+          var resolvedMode = val.resolved_mode || val.mode || 'localhost_only';
+          var configuredMode = val.configured_mode;
+          if (!configuredMode) {
+            if (resolvedMode === 'bearer_token') configuredMode = 'token';
+            else if (resolvedMode === 'password') configuredMode = 'password';
+            else if (resolvedMode === 'trusted_proxy') configuredMode = 'trusted_proxy';
+            else configuredMode = 'none';
+          }
+          if (configuredMode === 'token') {
+            return 'Mode: token' + (val.token_set ? ' (configured)' : ' (token missing)');
+          }
+          if (configuredMode === 'password') {
+            return 'Mode: password' + (val.password_set ? ' (configured)' : ' (secret missing)');
+          }
+          if (configuredMode === 'trusted_proxy') {
+            var count = val.trusted_proxy_ips_count || 0;
+            return 'Mode: trusted_proxy' + (count > 0 ? ' (' + count + ' trusted IPs)' : ' (trusted_ips missing)');
+          }
+          return 'Mode: localhost_only';
         default:
           return feature.configHint;
       }

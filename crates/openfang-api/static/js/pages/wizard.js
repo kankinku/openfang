@@ -16,6 +16,12 @@ function wizardPage() {
     testResult: null,
     savingKey: false,
     keySaved: false,
+    // Step 2: Gateway auth mode
+    apiAuthMode: 'token',
+    apiAuthSecretInput: '',
+    savingApiAuth: false,
+    apiAuthSaved: false,
+    apiAuthConfig: null,
 
     // Step 3: Agent creation
     templates: [
@@ -233,6 +239,7 @@ function wizardPage() {
     // Step 5: Summary
     setupSummary: {
       provider: '',
+      auth: '',
       agent: '',
       channel: ''
     },
@@ -243,7 +250,10 @@ function wizardPage() {
       this.loading = true;
       this.error = '';
       try {
-        await this.loadProviders();
+        await Promise.all([
+          this.loadProviders(),
+          this.loadApiAuthConfig()
+        ]);
       } catch(e) {
         this.error = e.message || 'Could not load setup data.';
       }
@@ -283,7 +293,7 @@ function wizardPage() {
     },
 
     get canGoNext() {
-      if (this.step === 2) return this.keySaved || this.hasConfiguredProvider;
+      if (this.step === 2) return (this.keySaved || this.hasConfiguredProvider) && this.isGatewayAuthReady;
       if (this.step === 3) return this.agentName.trim().length > 0;
       return true;
     },
@@ -293,6 +303,124 @@ function wizardPage() {
       return this.providers.some(function(p) {
         return p.auth_status === 'configured';
       });
+    },
+
+    apiAuthModeFromResolved(modeLabel) {
+      if (modeLabel === 'bearer_token') return 'token';
+      if (modeLabel === 'password') return 'password';
+      if (modeLabel === 'trusted_proxy') return 'trusted_proxy';
+      return 'none';
+    },
+
+    apiAuthModeFromConfigured(modeLabel) {
+      if (modeLabel === 'token') return 'token';
+      if (modeLabel === 'password') return 'password';
+      if (modeLabel === 'trusted_proxy') return 'trusted_proxy';
+      return 'none';
+    },
+
+    get resolvedApiAuthMode() {
+      return (this.apiAuthConfig && (this.apiAuthConfig.resolved_mode || this.apiAuthConfig.mode)) || 'localhost_only';
+    },
+
+    get configuredApiAuthMode() {
+      if (this.apiAuthConfig && this.apiAuthConfig.configured_mode) {
+        return this.apiAuthModeFromConfigured(this.apiAuthConfig.configured_mode);
+      }
+      return this.apiAuthModeFromResolved(this.resolvedApiAuthMode);
+    },
+
+    get isGatewayAuthReady() {
+      var mode = this.configuredApiAuthMode;
+      if (mode === 'token') return !!(this.apiAuthConfig && this.apiAuthConfig.token_set);
+      if (mode === 'password') return !!(this.apiAuthConfig && this.apiAuthConfig.password_set);
+      if (mode === 'trusted_proxy') return true;
+      if (this.apiAuthConfig && !this.apiAuthConfig.configured_mode && this.resolvedApiAuthMode === 'localhost_only') {
+        return false;
+      }
+      // Explicit localhost-only mode is acceptable.
+      return mode === 'none';
+    },
+
+    get apiAuthNeedsSecret() {
+      return this.apiAuthMode === 'token' || this.apiAuthMode === 'password';
+    },
+
+    get apiAuthSecretLabel() {
+      if (this.apiAuthMode === 'password') return 'Gateway Password';
+      return 'Gateway API Token';
+    },
+
+    get apiAuthSecretPlaceholder() {
+      if (this.apiAuthMode === 'password') return 'Enter a strong password for x-openfang-password';
+      return 'Enter a bearer token for API/WS access';
+    },
+
+    get apiAuthStatusLabel() {
+      var mode = this.configuredApiAuthMode;
+      if (mode === 'token') {
+        return this.apiAuthConfig && this.apiAuthConfig.token_set ? 'Token mode (configured)' : 'Token mode (token missing)';
+      }
+      if (mode === 'password') {
+        return this.apiAuthConfig && this.apiAuthConfig.password_set ? 'Password mode (configured)' : 'Password mode (secret missing)';
+      }
+      if (mode === 'trusted_proxy') return 'Trusted proxy mode';
+      return 'Localhost only';
+    },
+
+    async loadApiAuthConfig() {
+      try {
+        var config = await OpenFangAPI.get('/api/config');
+        var auth = (config && config.api_auth) || {};
+        this.apiAuthConfig = auth;
+        if (auth.configured_mode) {
+          this.apiAuthMode = this.apiAuthModeFromConfigured(auth.configured_mode);
+        } else {
+          this.apiAuthMode = this.apiAuthModeFromResolved(auth.resolved_mode || auth.mode);
+        }
+        this.setupSummary.auth = this.apiAuthStatusLabel;
+      } catch(e) {
+        this.apiAuthConfig = null;
+      }
+    },
+
+    async saveApiAuth() {
+      this.savingApiAuth = true;
+      this.apiAuthSaved = false;
+      try {
+        var secret = this.apiAuthSecretInput.trim();
+        if (this.apiAuthNeedsSecret && !secret) {
+          throw new Error(this.apiAuthMode === 'password' ? 'Enter a gateway password' : 'Enter a gateway token');
+        }
+
+        await OpenFangAPI.post('/api/config/set', { path: 'api_auth.mode', value: this.apiAuthMode });
+
+        if (this.apiAuthMode === 'token') {
+          await OpenFangAPI.post('/api/config/set', { path: 'api_auth.token_env', value: 'OPENFANG_API_TOKEN' });
+          await OpenFangAPI.post('/api/providers/api/key', { key: secret });
+          OpenFangAPI.setAuthToken(secret);
+        } else if (this.apiAuthMode === 'password') {
+          await OpenFangAPI.post('/api/config/set', { path: 'api_auth.password_env', value: 'OPENFANG_API_PASSWORD' });
+          await OpenFangAPI.post('/api/providers/api-password/key', { key: secret });
+          OpenFangAPI.setAuthToken('');
+        } else if (this.apiAuthMode === 'none') {
+          // Best-effort cleanup of gateway auth secrets.
+          await OpenFangAPI.del('/api/providers/api/key').catch(function() {});
+          await OpenFangAPI.del('/api/providers/api-password/key').catch(function() {});
+          OpenFangAPI.setAuthToken('');
+        } else if (this.apiAuthMode === 'trusted_proxy') {
+          OpenFangAPI.setAuthToken('');
+          OpenFangToast.warn('Trusted proxy mode needs trusted_ips/user_header in config.toml');
+        }
+
+        this.apiAuthSecretInput = '';
+        this.apiAuthSaved = true;
+        await this.loadApiAuthConfig();
+        OpenFangToast.success('Gateway auth updated');
+      } catch(e) {
+        OpenFangToast.error('Failed to save gateway auth: ' + e.message);
+      }
+      this.savingApiAuth = false;
     },
 
     // ── Step 2: Providers ──

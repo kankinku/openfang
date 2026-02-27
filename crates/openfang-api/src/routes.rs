@@ -4022,12 +4022,16 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse
     // Return a redacted view of the kernel config
     let config = &state.kernel.config;
     let auth_state = ApiAuthState::from_kernel_config(config);
+    let configured_mode =
+        serde_json::to_value(config.api_auth.mode).unwrap_or_else(|_| serde_json::json!("token"));
     Json(serde_json::json!({
         "home_dir": config.home_dir.to_string_lossy(),
         "data_dir": config.data_dir.to_string_lossy(),
         "api_key": if config.api_key.is_empty() { "not set" } else { "***" },
         "api_auth": {
             "mode": auth_state.mode_label(),
+            "resolved_mode": auth_state.mode_label(),
+            "configured_mode": configured_mode,
             "token_set": auth_state.token_set(),
             "password_set": auth_state.password_set(),
             "token_env": &config.api_auth.token_env,
@@ -4503,6 +4507,8 @@ pub async fn update_agent(
 /// GET /api/security — Security feature status for the dashboard.
 pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let auth_state = ApiAuthState::from_kernel_config(&state.kernel.config);
+    let configured_mode = serde_json::to_value(state.kernel.config.api_auth.mode)
+        .unwrap_or_else(|_| serde_json::json!("token"));
 
     let audit_count = state.kernel.audit_log.len();
 
@@ -4537,9 +4543,12 @@ pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoRes
             },
             "auth": {
                 "mode": auth_state.mode_label(),
+                "resolved_mode": auth_state.mode_label(),
+                "configured_mode": configured_mode,
                 "token_set": auth_state.token_set(),
                 "password_set": auth_state.password_set(),
-                "auth_enabled": auth_state.auth_enabled()
+                "auth_enabled": auth_state.auth_enabled(),
+                "trusted_proxy_ips_count": state.kernel.config.api_auth.trusted_proxy.trusted_ips.len()
             }
         },
         "monitoring": {
@@ -5694,6 +5703,14 @@ pub async fn set_agent_mcp_servers(
 
 // ── Provider Key Management Endpoints ──────────────────────────────────
 
+fn special_provider_env_var(provider: &str) -> Option<&'static str> {
+    match provider.trim().to_lowercase().as_str() {
+        "api" | "gateway" | "openfang" => Some("OPENFANG_API_TOKEN"),
+        "api-password" | "gateway-password" => Some("OPENFANG_API_PASSWORD"),
+        _ => None,
+    }
+}
+
 /// GET /api/auth/profiles — List auth profile store (provider/env mappings).
 pub async fn list_auth_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let store = openfang_runtime::auth_profiles_store::load_store(&state.kernel.config.home_dir);
@@ -5789,20 +5806,7 @@ pub async fn set_provider_key(
     Path(name): Path<String>,
     Json(body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    // Validate provider name against known list
-    {
-        let catalog = state
-            .kernel
-            .model_catalog
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        if catalog.get_provider(&name).is_none() {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": format!("Unknown provider '{}'", name)})),
-            );
-        }
-    }
+    let name_norm = name.trim().to_lowercase();
 
     let key = match body["key"].as_str() {
         Some(k) if !k.trim().is_empty() => k.trim().to_string(),
@@ -5814,16 +5818,29 @@ pub async fn set_provider_key(
         }
     };
 
-    let env_var = {
-        let catalog = state
-            .kernel
-            .model_catalog
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        catalog
-            .get_provider(&name)
-            .map(|p| p.api_key_env.clone())
-            .unwrap_or_default()
+    let (env_var, is_special_provider) = if let Some(env_var) = special_provider_env_var(&name_norm)
+    {
+        (env_var.to_string(), true)
+    } else {
+        let env_var = {
+            let catalog = state
+                .kernel
+                .model_catalog
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            match catalog.get_provider(&name_norm) {
+                Some(p) => p.api_key_env.clone(),
+                None => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(
+                            serde_json::json!({"error": format!("Unknown provider '{}'", name_norm)}),
+                        ),
+                    );
+                }
+            }
+        };
+        (env_var, false)
     };
 
     if env_var.is_empty() {
@@ -5846,18 +5863,20 @@ pub async fn set_provider_key(
     std::env::set_var(&env_var, &key);
 
     // Keep auth profile store in sync (provider:default -> env var mapping).
-    if let Err(e) = openfang_runtime::auth_profiles_store::upsert_env_profile(
-        &state.kernel.config.home_dir,
-        &name,
-        "default",
-        &env_var,
-        "api_key",
-    ) {
-        tracing::warn!(
-            provider = %name,
-            error = %e,
-            "Failed to update auth profile store after provider key save"
-        );
+    if !is_special_provider {
+        if let Err(e) = openfang_runtime::auth_profiles_store::upsert_env_profile(
+            &state.kernel.config.home_dir,
+            &name_norm,
+            "default",
+            &env_var,
+            "api_key",
+        ) {
+            tracing::warn!(
+                provider = %name_norm,
+                error = %e,
+                "Failed to update auth profile store after provider key save"
+            );
+        }
     }
 
     // Refresh auth detection
@@ -5870,7 +5889,7 @@ pub async fn set_provider_key(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({"status": "saved", "provider": name})),
+        Json(serde_json::json!({"status": "saved", "provider": name_norm, "env_var": env_var})),
     )
 }
 
@@ -5879,22 +5898,31 @@ pub async fn delete_provider_key(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let env_var = {
-        let catalog = state
-            .kernel
-            .model_catalog
-            .read()
-            .unwrap_or_else(|e| e.into_inner());
-        match catalog.get_provider(&name) {
-            Some(p) => p.api_key_env.clone(),
-            None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Unknown provider '{}'", name)})),
-                );
-            }
-        }
-    };
+    let name_norm = name.trim().to_lowercase();
+    let (env_var, is_special_provider) =
+        if let Some(env_var) = special_provider_env_var(&name_norm) {
+            (env_var.to_string(), true)
+        } else {
+            let env_var = {
+                let catalog = state
+                    .kernel
+                    .model_catalog
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                match catalog.get_provider(&name_norm) {
+                    Some(p) => p.api_key_env.clone(),
+                    None => {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            Json(
+                                serde_json::json!({"error": format!("Unknown provider '{}'", name_norm)}),
+                            ),
+                        );
+                    }
+                }
+            };
+            (env_var, false)
+        };
 
     if env_var.is_empty() {
         return (
@@ -5916,16 +5944,18 @@ pub async fn delete_provider_key(
     std::env::remove_var(&env_var);
 
     // Remove provider default profile mapping (best-effort).
-    if let Err(e) = openfang_runtime::auth_profiles_store::remove_profile(
-        &state.kernel.config.home_dir,
-        &name,
-        "default",
-    ) {
-        tracing::warn!(
-            provider = %name,
-            error = %e,
-            "Failed to update auth profile store after provider key delete"
-        );
+    if !is_special_provider {
+        if let Err(e) = openfang_runtime::auth_profiles_store::remove_profile(
+            &state.kernel.config.home_dir,
+            &name_norm,
+            "default",
+        ) {
+            tracing::warn!(
+                provider = %name_norm,
+                error = %e,
+                "Failed to update auth profile store after provider key delete"
+            );
+        }
     }
 
     // Refresh auth detection
@@ -5938,7 +5968,7 @@ pub async fn delete_provider_key(
 
     (
         StatusCode::OK,
-        Json(serde_json::json!({"status": "removed", "provider": name})),
+        Json(serde_json::json!({"status": "removed", "provider": name_norm, "env_var": env_var})),
     )
 }
 
@@ -5947,18 +5977,46 @@ pub async fn test_provider(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    let name_norm = name.trim().to_lowercase();
+    if let Some(env_var) = special_provider_env_var(&name_norm) {
+        let configured = std::env::var(env_var)
+            .ok()
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if configured {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "provider": name_norm,
+                    "env_var": env_var,
+                    "latency_ms": 0,
+                })),
+            );
+        }
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "error",
+                "provider": name_norm,
+                "env_var": env_var,
+                "error": "Provider API key not configured",
+            })),
+        );
+    }
+
     let (env_var, base_url, key_required) = {
         let catalog = state
             .kernel
             .model_catalog
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        match catalog.get_provider(&name) {
+        match catalog.get_provider(&name_norm) {
             Some(p) => (p.api_key_env.clone(), p.base_url.clone(), p.key_required),
             None => {
                 return (
                     StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": format!("Unknown provider '{}'", name)})),
+                    Json(serde_json::json!({"error": format!("Unknown provider '{}'", name_norm)})),
                 );
             }
         }
@@ -5976,7 +6034,7 @@ pub async fn test_provider(
     // Attempt a lightweight connectivity test
     let start = std::time::Instant::now();
     let driver_config = openfang_runtime::llm_driver::DriverConfig {
-        provider: name.clone(),
+        provider: name_norm.clone(),
         api_key,
         base_url: if base_url.is_empty() {
             None
@@ -6004,7 +6062,7 @@ pub async fn test_provider(
                         StatusCode::OK,
                         Json(serde_json::json!({
                             "status": "ok",
-                            "provider": name,
+                            "provider": name_norm,
                             "latency_ms": latency_ms,
                         })),
                     )
@@ -6013,7 +6071,7 @@ pub async fn test_provider(
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "status": "error",
-                        "provider": name,
+                        "provider": name_norm,
                         "error": format!("{e}"),
                     })),
                 ),
@@ -6023,7 +6081,7 @@ pub async fn test_provider(
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "error",
-                "provider": name,
+                "provider": name_norm,
                 "error": format!("Failed to create driver: {e}"),
             })),
         ),

@@ -131,10 +131,41 @@ document.addEventListener('alpine:init', function() {
     async checkOnboarding() {
       if (localStorage.getItem('openfang-onboarded')) return;
       try {
-        var config = await OpenFangAPI.get('/api/config');
-        var apiKey = config && config.api_key;
-        var noKey = !apiKey || apiKey === 'not set' || apiKey === '';
-        if (noKey && this.agentCount === 0) {
+        var results = await Promise.all([
+          OpenFangAPI.get('/api/config').catch(function() { return null; }),
+          OpenFangAPI.get('/api/providers').catch(function() { return null; })
+        ]);
+        var config = results[0] || {};
+        var providersResp = results[1] || {};
+        var providers = providersResp.providers || [];
+
+        var hasProvider = providers.some(function(p) {
+          return p.auth_status === 'configured';
+        });
+
+        var apiAuth = config.api_auth || {};
+        var resolvedMode = apiAuth.resolved_mode || apiAuth.mode || 'localhost_only';
+        var configuredMode = apiAuth.configured_mode;
+        if (!configuredMode) {
+          if (resolvedMode === 'bearer_token') configuredMode = 'token';
+          else if (resolvedMode === 'password') configuredMode = 'password';
+          else if (resolvedMode === 'trusted_proxy') configuredMode = 'trusted_proxy';
+          else configuredMode = 'none';
+        }
+
+        var gatewayAuthReady = false;
+        if (configuredMode === 'token') {
+          gatewayAuthReady = !!apiAuth.token_set;
+        } else if (configuredMode === 'password') {
+          gatewayAuthReady = !!apiAuth.password_set;
+        } else if (configuredMode === 'trusted_proxy') {
+          gatewayAuthReady = true;
+        } else if (configuredMode === 'none') {
+          // Explicit localhost-only mode is acceptable.
+          gatewayAuthReady = !(resolvedMode === 'localhost_only' && !apiAuth.configured_mode);
+        }
+
+        if (this.agentCount === 0 && (!hasProvider || !gatewayAuthReady)) {
           this.showOnboarding = true;
         }
       } catch(e) {
