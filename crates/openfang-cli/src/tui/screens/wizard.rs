@@ -1,4 +1,4 @@
-//! Setup wizard: provider list → API key → model → config save.
+//! Setup wizard: provider list → API key → gateway auth → model → config save.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -100,9 +100,18 @@ pub fn needs_setup() -> bool {
 pub enum WizardStep {
     Provider,
     ApiKey,
+    GatewayAuth,
     Model,
     Saving,
     Done,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatewayAuthMode {
+    Token,
+    Password,
+    None,
+    TrustedProxy,
 }
 
 pub struct WizardState {
@@ -112,6 +121,10 @@ pub struct WizardState {
     pub selected_provider: Option<usize>, // index into PROVIDERS
     pub api_key_input: String,
     pub api_key_from_env: bool,
+    gateway_auth_list: ListState,
+    gateway_auth_mode: GatewayAuthMode,
+    gateway_auth_secret_input: String,
+    gateway_auth_error: String,
     pub model_input: String,
     pub status_msg: String,
     pub created_config: Option<PathBuf>,
@@ -126,12 +139,17 @@ impl WizardState {
             selected_provider: None,
             api_key_input: String::new(),
             api_key_from_env: false,
+            gateway_auth_list: ListState::default(),
+            gateway_auth_mode: GatewayAuthMode::Token,
+            gateway_auth_secret_input: String::new(),
+            gateway_auth_error: String::new(),
             model_input: String::new(),
             status_msg: String::new(),
             created_config: None,
         };
         state.build_provider_order();
         state.provider_list.select(Some(0));
+        state.gateway_auth_list.select(Some(0));
         state
     }
 
@@ -140,11 +158,15 @@ impl WizardState {
         self.selected_provider = None;
         self.api_key_input.clear();
         self.api_key_from_env = false;
+        self.gateway_auth_mode = GatewayAuthMode::Token;
+        self.gateway_auth_secret_input.clear();
+        self.gateway_auth_error.clear();
         self.model_input.clear();
         self.status_msg.clear();
         self.created_config = None;
         self.build_provider_order();
         self.provider_list.select(Some(0));
+        self.gateway_auth_list.select(Some(0));
     }
 
     fn build_provider_order(&mut self) {
@@ -167,6 +189,60 @@ impl WizardState {
         self.selected_provider.map(|i| &PROVIDERS[i])
     }
 
+    fn selected_gateway_auth_mode(&self) -> GatewayAuthMode {
+        match self.gateway_auth_list.selected().unwrap_or(0) {
+            0 => GatewayAuthMode::Token,
+            1 => GatewayAuthMode::Password,
+            2 => GatewayAuthMode::None,
+            _ => GatewayAuthMode::TrustedProxy,
+        }
+    }
+
+    fn gateway_auth_needs_secret(&self) -> bool {
+        matches!(
+            self.selected_gateway_auth_mode(),
+            GatewayAuthMode::Token | GatewayAuthMode::Password
+        )
+    }
+
+    fn persist_gateway_auth_secret(&mut self) -> Result<(), String> {
+        let mode = self.selected_gateway_auth_mode();
+        self.gateway_auth_mode = mode;
+        self.gateway_auth_error.clear();
+
+        let token_env = "OPENFANG_API_TOKEN";
+        let password_env = "OPENFANG_API_PASSWORD";
+        match mode {
+            GatewayAuthMode::Token => {
+                let secret = self.gateway_auth_secret_input.trim();
+                if secret.is_empty() {
+                    return Err("Enter a gateway token".to_string());
+                }
+                crate::dotenv::save_env_key(token_env, secret)?;
+                let _ = crate::dotenv::remove_env_key(password_env);
+                std::env::set_var(token_env, secret);
+                std::env::remove_var(password_env);
+            }
+            GatewayAuthMode::Password => {
+                let secret = self.gateway_auth_secret_input.trim();
+                if secret.is_empty() {
+                    return Err("Enter a gateway password".to_string());
+                }
+                crate::dotenv::save_env_key(password_env, secret)?;
+                let _ = crate::dotenv::remove_env_key(token_env);
+                std::env::set_var(password_env, secret);
+                std::env::remove_var(token_env);
+            }
+            GatewayAuthMode::None | GatewayAuthMode::TrustedProxy => {
+                let _ = crate::dotenv::remove_env_key(token_env);
+                let _ = crate::dotenv::remove_env_key(password_env);
+                std::env::remove_var(token_env);
+                std::env::remove_var(password_env);
+            }
+        }
+        Ok(())
+    }
+
     /// Handle a key event. Returns true if wizard is complete or cancelled.
     /// `cancelled` is set if the user backed out entirely.
     pub fn handle_key(&mut self, key: KeyEvent) -> WizardResult {
@@ -177,6 +253,7 @@ impl WizardState {
         match self.step {
             WizardStep::Provider => self.handle_provider(key),
             WizardStep::ApiKey => self.handle_api_key(key),
+            WizardStep::GatewayAuth => self.handle_gateway_auth(key),
             WizardStep::Model => self.handle_model(key),
             WizardStep::Saving | WizardStep::Done => WizardResult::Continue,
         }
@@ -210,15 +287,15 @@ impl WizardState {
                     self.selected_provider = Some(prov_idx);
 
                     if !p.needs_key {
-                        // No key needed, skip to model
+                        // No key needed, skip to gateway auth
                         self.api_key_from_env = false;
                         self.model_input = p.default_model.to_string();
-                        self.step = WizardStep::Model;
+                        self.step = WizardStep::GatewayAuth;
                     } else if std::env::var(p.env_var).is_ok() {
                         // Key already in env
                         self.api_key_from_env = true;
                         self.model_input = p.default_model.to_string();
-                        self.step = WizardStep::Model;
+                        self.step = WizardStep::GatewayAuth;
                     } else {
                         self.api_key_from_env = false;
                         self.api_key_input.clear();
@@ -239,9 +316,11 @@ impl WizardState {
             KeyCode::Enter => {
                 if !self.api_key_input.is_empty() {
                     if let Some(p) = self.selected_provider_info() {
+                        let _ = crate::dotenv::save_env_key(p.env_var, &self.api_key_input);
+                        std::env::set_var(p.env_var, &self.api_key_input);
                         self.model_input = p.default_model.to_string();
                     }
-                    self.step = WizardStep::Model;
+                    self.step = WizardStep::GatewayAuth;
                 }
             }
             KeyCode::Char(c) => {
@@ -258,16 +337,7 @@ impl WizardState {
     fn handle_model(&mut self, key: KeyEvent) -> WizardResult {
         match key.code {
             KeyCode::Esc => {
-                // Go back
-                if let Some(p) = self.selected_provider_info() {
-                    if p.needs_key && !self.api_key_from_env {
-                        self.step = WizardStep::ApiKey;
-                    } else {
-                        self.step = WizardStep::Provider;
-                    }
-                } else {
-                    self.step = WizardStep::Provider;
-                }
+                self.step = WizardStep::GatewayAuth;
             }
             KeyCode::Enter => {
                 self.step = WizardStep::Saving;
@@ -278,6 +348,57 @@ impl WizardState {
             }
             KeyCode::Backspace => {
                 self.model_input.pop();
+            }
+            _ => {}
+        }
+        WizardResult::Continue
+    }
+
+    fn handle_gateway_auth(&mut self, key: KeyEvent) -> WizardResult {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(p) = self.selected_provider_info() {
+                    if p.needs_key && !self.api_key_from_env {
+                        self.step = WizardStep::ApiKey;
+                    } else {
+                        self.step = WizardStep::Provider;
+                    }
+                } else {
+                    self.step = WizardStep::Provider;
+                }
+            }
+            KeyCode::Up => {
+                let i = self.gateway_auth_list.selected().unwrap_or(0);
+                let next = if i == 0 { 3 } else { i - 1 };
+                self.gateway_auth_list.select(Some(next));
+                self.gateway_auth_error.clear();
+            }
+            KeyCode::Down => {
+                let i = self.gateway_auth_list.selected().unwrap_or(0);
+                let next = (i + 1) % 4;
+                self.gateway_auth_list.select(Some(next));
+                self.gateway_auth_error.clear();
+            }
+            KeyCode::Enter => match self.persist_gateway_auth_secret() {
+                Ok(()) => {
+                    self.gateway_auth_error.clear();
+                    self.step = WizardStep::Model;
+                }
+                Err(e) => {
+                    self.gateway_auth_error = e;
+                }
+            },
+            KeyCode::Char(c) => {
+                if self.gateway_auth_needs_secret() {
+                    self.gateway_auth_secret_input.push(c);
+                    self.gateway_auth_error.clear();
+                }
+            }
+            KeyCode::Backspace => {
+                if self.gateway_auth_needs_secret() {
+                    self.gateway_auth_secret_input.pop();
+                    self.gateway_auth_error.clear();
+                }
             }
             _ => {}
         }
@@ -308,34 +429,51 @@ impl WizardState {
         let _ = std::fs::create_dir_all(openfang_dir.join("data"));
         crate::restrict_dir_permissions(&openfang_dir);
 
-        let api_key_line = if !self.api_key_input.is_empty() {
-            format!("api_key = \"{}\"", self.api_key_input)
-        } else {
-            format!("api_key_env = \"{}\"", p.env_var)
-        };
-
         let model = if self.model_input.is_empty() {
             p.default_model
         } else {
             &self.model_input
         };
 
+        let api_auth_mode = match self.gateway_auth_mode {
+            GatewayAuthMode::Token => "token",
+            GatewayAuthMode::Password => "password",
+            GatewayAuthMode::None => "none",
+            GatewayAuthMode::TrustedProxy => "trusted_proxy",
+        };
+        let trusted_proxy_section =
+            if matches!(self.gateway_auth_mode, GatewayAuthMode::TrustedProxy) {
+                r#"
+[api_auth.trusted_proxy]
+user_header = "x-openfang-user"
+trusted_ips = []
+"#
+            } else {
+                ""
+            };
+
         let config = format!(
             r#"# OpenFang Agent OS configuration
 # Generated by setup wizard
 
+api_listen = "127.0.0.1:4200"
+
+[api_auth]
+mode = "{api_auth_mode}"
+token_env = "OPENFANG_API_TOKEN"
+password_env = "OPENFANG_API_PASSWORD"
+{trusted_proxy_section}
+
 [default_model]
 provider = "{provider}"
 model = "{model}"
-{api_key_line}
+api_key_env = "{api_key_env}"
 
 [memory]
 decay_rate = 0.05
-
-[network]
-listen_addr = "127.0.0.1:4200"
 "#,
             provider = p.name,
+            api_key_env = p.env_var,
         );
 
         let config_path = openfang_dir.join("config.toml");
@@ -367,9 +505,10 @@ pub fn draw(f: &mut Frame, area: Rect, state: &mut WizardState) {
     );
 
     let step_label = match state.step {
-        WizardStep::Provider => "Step 1 of 3",
-        WizardStep::ApiKey => "Step 2 of 3",
-        WizardStep::Model => "Step 3 of 3",
+        WizardStep::Provider => "Step 1 of 4",
+        WizardStep::ApiKey => "Step 2 of 4",
+        WizardStep::GatewayAuth => "Step 3 of 4",
+        WizardStep::Model => "Step 4 of 4",
         WizardStep::Saving => "Saving...",
         WizardStep::Done => "Complete",
     };
@@ -419,6 +558,7 @@ pub fn draw(f: &mut Frame, area: Rect, state: &mut WizardState) {
     match state.step {
         WizardStep::Provider => draw_provider(f, chunks[3], state),
         WizardStep::ApiKey => draw_api_key(f, chunks[3], state),
+        WizardStep::GatewayAuth => draw_gateway_auth(f, chunks[3], state),
         WizardStep::Model => draw_model(f, chunks[3], state),
         WizardStep::Saving | WizardStep::Done => draw_done(f, chunks[3], state),
     }
@@ -518,6 +658,111 @@ fn draw_api_key(f: &mut Frame, area: Rect, state: &mut WizardState) {
         theme::hint_style(),
     )]));
     f.render_widget(hints, chunks[4]);
+}
+
+fn draw_gateway_auth(f: &mut Frame, area: Rect, state: &mut WizardState) {
+    let needs_secret = state.gateway_auth_needs_secret();
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::raw("  Gateway API auth mode:")])),
+        chunks[0],
+    );
+
+    let items = vec![
+        ListItem::new(Line::from(vec![
+            Span::raw("  Token"),
+            Span::styled("  (recommended) Bearer token", theme::dim_style()),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::raw("  Password"),
+            Span::styled("  x-openfang-password header", theme::dim_style()),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::raw("  Localhost only"),
+            Span::styled("  local access only", theme::dim_style()),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::raw("  Trusted proxy"),
+            Span::styled("  advanced (trusted IPs required)", theme::dim_style()),
+        ])),
+    ];
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .bg(theme::BG_HOVER)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("\u{25b8} ");
+    f.render_stateful_widget(list, chunks[1], &mut state.gateway_auth_list);
+
+    if needs_secret {
+        let env_var = match state.selected_gateway_auth_mode() {
+            GatewayAuthMode::Token => "OPENFANG_API_TOKEN",
+            GatewayAuthMode::Password => "OPENFANG_API_PASSWORD",
+            GatewayAuthMode::None | GatewayAuthMode::TrustedProxy => "",
+        };
+        let masked: String = "\u{2022}".repeat(state.gateway_auth_secret_input.len());
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw("  > "),
+                Span::styled(masked, theme::input_style()),
+                Span::styled(
+                    "\u{2588}",
+                    Style::default()
+                        .fg(theme::GREEN)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ])),
+            chunks[2],
+        );
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("    Saved as {env_var} in ~/.openfang/.env"),
+                theme::dim_style(),
+            )])),
+            chunks[3],
+        );
+    } else {
+        let msg = match state.selected_gateway_auth_mode() {
+            GatewayAuthMode::None => "    Localhost-only mode selected",
+            GatewayAuthMode::TrustedProxy => {
+                "    Configure api_auth.trusted_proxy.trusted_ips after setup"
+            }
+            _ => "",
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(msg, theme::dim_style())])),
+            chunks[2],
+        );
+    }
+
+    if !state.gateway_auth_error.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("    \u{26a0} {}", state.gateway_auth_error),
+                Style::default().fg(theme::YELLOW),
+            )])),
+            chunks[4],
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "    [\u{2191}\u{2193}] Navigate  [Enter] Confirm  [Esc] Back",
+            theme::hint_style(),
+        )])),
+        chunks[5],
+    );
 }
 
 fn draw_model(f: &mut Frame, area: Rect, state: &mut WizardState) {

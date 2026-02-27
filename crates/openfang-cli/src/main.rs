@@ -1113,7 +1113,7 @@ fn cmd_init_quick(openfang_dir: &std::path::Path) {
     ]);
 }
 
-/// Interactive 5-step onboarding wizard (ratatui TUI).
+/// Interactive onboarding wizard (ratatui TUI).
 fn cmd_init_interactive(openfang_dir: &std::path::Path) {
     use tui::screens::init_wizard::{self, InitResult, LaunchChoice};
 

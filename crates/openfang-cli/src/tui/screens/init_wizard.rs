@@ -1,4 +1,4 @@
-//! Standalone ratatui init wizard: 6-step onboarding flow.
+//! Standalone ratatui init wizard: onboarding flow with provider + gateway auth.
 //!
 //! Launched by `openfang init` (without `--quick`). Takes over the terminal,
 //! runs its own event loop, and returns an `InitResult`.
@@ -146,9 +146,18 @@ enum Step {
     Migration,
     Provider,
     ApiKey,
+    GatewayAuth,
     Model,
     Routing,
     Complete,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatewayAuthMode {
+    Token,
+    Password,
+    None,
+    TrustedProxy,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,6 +225,12 @@ struct State {
     key_test: KeyTestState,
     key_test_started: Option<Instant>,
 
+    // Gateway auth
+    gateway_auth_list: ListState,
+    gateway_auth_mode: GatewayAuthMode,
+    gateway_auth_secret_input: String,
+    gateway_auth_error: String,
+
     // Model selection
     model_input: String,
     model_catalog: ModelCatalog,
@@ -259,6 +274,10 @@ impl State {
             api_key_from_env: false,
             key_test: KeyTestState::Idle,
             key_test_started: None,
+            gateway_auth_list: ListState::default(),
+            gateway_auth_mode: GatewayAuthMode::Token,
+            gateway_auth_secret_input: String::new(),
+            gateway_auth_error: String::new(),
             model_input: String::new(),
             model_catalog: ModelCatalog::new(),
             model_entries: Vec::new(),
@@ -279,6 +298,7 @@ impl State {
         s.provider_list.select(Some(0));
         s.migration_choice_list.select(Some(0));
         s.routing_choice_list.select(Some(0));
+        s.gateway_auth_list.select(Some(0));
         s.complete_list.select(Some(0));
         s
     }
@@ -306,15 +326,70 @@ impl State {
         self.selected_provider.map(|i| &PROVIDERS[i])
     }
 
+    fn selected_gateway_auth_mode(&self) -> GatewayAuthMode {
+        match self.gateway_auth_list.selected().unwrap_or(0) {
+            0 => GatewayAuthMode::Token,
+            1 => GatewayAuthMode::Password,
+            2 => GatewayAuthMode::None,
+            _ => GatewayAuthMode::TrustedProxy,
+        }
+    }
+
+    fn gateway_auth_needs_secret(&self) -> bool {
+        matches!(
+            self.selected_gateway_auth_mode(),
+            GatewayAuthMode::Token | GatewayAuthMode::Password
+        )
+    }
+
+    fn persist_gateway_auth_secret(&mut self) -> Result<(), String> {
+        let mode = self.selected_gateway_auth_mode();
+        self.gateway_auth_mode = mode;
+        self.gateway_auth_error.clear();
+
+        let token_env = "OPENFANG_API_TOKEN";
+        let password_env = "OPENFANG_API_PASSWORD";
+        match mode {
+            GatewayAuthMode::Token => {
+                let secret = self.gateway_auth_secret_input.trim();
+                if secret.is_empty() {
+                    return Err("Enter a gateway token".to_string());
+                }
+                crate::dotenv::save_env_key(token_env, secret)?;
+                let _ = crate::dotenv::remove_env_key(password_env);
+                std::env::set_var(token_env, secret);
+                std::env::remove_var(password_env);
+            }
+            GatewayAuthMode::Password => {
+                let secret = self.gateway_auth_secret_input.trim();
+                if secret.is_empty() {
+                    return Err("Enter a gateway password".to_string());
+                }
+                crate::dotenv::save_env_key(password_env, secret)?;
+                let _ = crate::dotenv::remove_env_key(token_env);
+                std::env::set_var(password_env, secret);
+                std::env::remove_var(token_env);
+            }
+            GatewayAuthMode::None | GatewayAuthMode::TrustedProxy => {
+                let _ = crate::dotenv::remove_env_key(token_env);
+                let _ = crate::dotenv::remove_env_key(password_env);
+                std::env::remove_var(token_env);
+                std::env::remove_var(password_env);
+            }
+        }
+        Ok(())
+    }
+
     fn step_label(&self) -> &'static str {
         match self.step {
-            Step::Welcome => "1 of 7",
-            Step::Migration => "2 of 7",
-            Step::Provider => "3 of 7",
-            Step::ApiKey => "4 of 7",
-            Step::Model => "5 of 7",
-            Step::Routing => "6 of 7",
-            Step::Complete => "7 of 7",
+            Step::Welcome => "1 of 8",
+            Step::Migration => "2 of 8",
+            Step::Provider => "3 of 8",
+            Step::ApiKey => "4 of 8",
+            Step::GatewayAuth => "5 of 8",
+            Step::Model => "6 of 8",
+            Step::Routing => "7 of 8",
+            Step::Complete => "8 of 8",
         }
     }
 
@@ -502,7 +577,8 @@ pub fn run() -> InitResult {
             if let Some(started) = state.key_test_started {
                 if started.elapsed() >= Duration::from_millis(600) {
                     state.load_models_for_provider();
-                    state.step = Step::Model;
+                    state.gateway_auth_error.clear();
+                    state.step = Step::GatewayAuth;
                     state.key_test = KeyTestState::Idle;
                     state.key_test_started = None;
                 }
@@ -622,11 +698,13 @@ pub fn run() -> InitResult {
                                 if !p.needs_key {
                                     state.api_key_from_env = false;
                                     state.load_models_for_provider();
-                                    state.step = Step::Model;
+                                    state.gateway_auth_error.clear();
+                                    state.step = Step::GatewayAuth;
                                 } else if state.is_provider_detected(prov_idx) {
                                     state.api_key_from_env = true;
                                     state.load_models_for_provider();
-                                    state.step = Step::Model;
+                                    state.gateway_auth_error.clear();
+                                    state.step = Step::GatewayAuth;
                                 } else {
                                     state.api_key_from_env = false;
                                     state.api_key_input.clear();
@@ -688,11 +766,10 @@ pub fn run() -> InitResult {
                         }
                     }
 
-                    Step::Model => match key.code {
+                    Step::GatewayAuth => match key.code {
                         KeyCode::Esc => {
                             if let Some(p) = state.provider() {
                                 if p.needs_key && !state.api_key_from_env {
-                                    state.key_test = KeyTestState::Idle;
                                     state.step = Step::ApiKey;
                                 } else {
                                     state.step = Step::Provider;
@@ -700,6 +777,48 @@ pub fn run() -> InitResult {
                             } else {
                                 state.step = Step::Provider;
                             }
+                        }
+                        KeyCode::Up => {
+                            let i = state.gateway_auth_list.selected().unwrap_or(0);
+                            let next = if i == 0 { 3 } else { i - 1 };
+                            state.gateway_auth_list.select(Some(next));
+                            state.gateway_auth_error.clear();
+                        }
+                        KeyCode::Down => {
+                            let i = state.gateway_auth_list.selected().unwrap_or(0);
+                            let next = (i + 1) % 4;
+                            state.gateway_auth_list.select(Some(next));
+                            state.gateway_auth_error.clear();
+                        }
+                        KeyCode::Enter => {
+                            match state.persist_gateway_auth_secret() {
+                                Ok(()) => {
+                                    state.gateway_auth_error.clear();
+                                    state.step = Step::Model;
+                                }
+                                Err(e) => {
+                                    state.gateway_auth_error = e;
+                                }
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if state.gateway_auth_needs_secret() {
+                                state.gateway_auth_secret_input.push(c);
+                                state.gateway_auth_error.clear();
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if state.gateway_auth_needs_secret() {
+                                state.gateway_auth_secret_input.pop();
+                                state.gateway_auth_error.clear();
+                            }
+                        }
+                        _ => {}
+                    },
+
+                    Step::Model => match key.code {
+                        KeyCode::Esc => {
+                            state.step = Step::GatewayAuth;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             let len = state.model_entries.len().max(1);
@@ -963,6 +1082,23 @@ fn save_config(state: &mut State) {
         &state.model_input
     };
 
+    let api_auth_mode = match state.gateway_auth_mode {
+        GatewayAuthMode::Token => "token",
+        GatewayAuthMode::Password => "password",
+        GatewayAuthMode::None => "none",
+        GatewayAuthMode::TrustedProxy => "trusted_proxy",
+    };
+    let trusted_proxy_section = if matches!(state.gateway_auth_mode, GatewayAuthMode::TrustedProxy)
+    {
+        r#"
+[api_auth.trusted_proxy]
+user_header = "x-openfang-user"
+trusted_ips = []
+"#
+    } else {
+        ""
+    };
+
     let routing_section = if state.routing_enabled {
         format!(
             r#"
@@ -989,9 +1125,10 @@ complex_threshold = 500
 api_listen = "127.0.0.1:4200"
 
 [api_auth]
-mode = "token"
+mode = "{api_auth_mode}"
 token_env = "OPENFANG_API_TOKEN"
 password_env = "OPENFANG_API_PASSWORD"
+{trusted_proxy_section}
 
 [default_model]
 provider = "{provider}"
@@ -1078,7 +1215,7 @@ fn draw(f: &mut Frame, area: Rect, state: &mut State) {
     ])
     .split(content);
 
-    // Header: "OpenFang Init  Step X of 7"
+    // Header: "OpenFang Init  Step X of 8"
     let header = Line::from(vec![
         Span::styled(
             "OpenFang",
@@ -1105,6 +1242,7 @@ fn draw(f: &mut Frame, area: Rect, state: &mut State) {
         Step::Migration => draw_migration(f, chunks[3], state),
         Step::Provider => draw_provider(f, chunks[3], state),
         Step::ApiKey => draw_api_key(f, chunks[3], state),
+        Step::GatewayAuth => draw_gateway_auth(f, chunks[3], state),
         Step::Model => draw_model(f, chunks[3], state),
         Step::Routing => draw_routing(f, chunks[3], state),
         Step::Complete => draw_complete(f, chunks[3], state),
@@ -1716,6 +1854,107 @@ fn draw_api_key(f: &mut Frame, area: Rect, state: &mut State) {
     f.render_widget(
         Paragraph::new(Line::from(vec![Span::styled(
             "  [Enter] Confirm  [Esc] Back",
+            theme::hint_style(),
+        )])),
+        chunks[5],
+    );
+}
+
+fn draw_gateway_auth(f: &mut Frame, area: Rect, state: &mut State) {
+    let needs_secret = state.gateway_auth_needs_secret();
+    let chunks = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(4),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    let prompt = Paragraph::new(Line::from(vec![Span::raw(
+        "  Choose gateway API auth mode:",
+    )]));
+    f.render_widget(prompt, chunks[0]);
+
+    let items = vec![
+        ListItem::new(Line::from(vec![
+            Span::raw("  Token"),
+            Span::styled(
+                "  (recommended) Authorization: Bearer <token>",
+                theme::dim_style(),
+            ),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::raw("  Password"),
+            Span::styled("  x-openfang-password header", theme::dim_style()),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::raw("  Localhost only"),
+            Span::styled("  no remote auth, local access only", theme::dim_style()),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::raw("  Trusted proxy"),
+            Span::styled("  advanced; requires trusted IP allowlist", theme::dim_style()),
+        ])),
+    ];
+    let list = List::new(items)
+        .highlight_style(theme::selected_style())
+        .highlight_symbol("\u{25b8} ");
+    f.render_stateful_widget(list, chunks[1], &mut state.gateway_auth_list);
+
+    if needs_secret {
+        let env_var = match state.selected_gateway_auth_mode() {
+            GatewayAuthMode::Token => "OPENFANG_API_TOKEN",
+            GatewayAuthMode::Password => "OPENFANG_API_PASSWORD",
+            GatewayAuthMode::None | GatewayAuthMode::TrustedProxy => "",
+        };
+        let masked: String = "\u{2022}".repeat(state.gateway_auth_secret_input.len());
+        let input = Paragraph::new(Line::from(vec![
+            Span::raw("  \u{25b8} "),
+            Span::styled(masked, theme::input_style()),
+            Span::styled(
+                "\u{2588}",
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            ),
+        ]));
+        f.render_widget(input, chunks[2]);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("    Saved as {env_var} in ~/.openfang/.env"),
+                theme::dim_style(),
+            )])),
+            chunks[3],
+        );
+    } else {
+        let note = match state.selected_gateway_auth_mode() {
+            GatewayAuthMode::None => "  Localhost-only mode selected",
+            GatewayAuthMode::TrustedProxy => {
+                "  Set api_auth.trusted_proxy.trusted_ips in ~/.openfang/config.toml"
+            }
+            _ => "",
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(note, theme::dim_style())])),
+            chunks[2],
+        );
+    }
+
+    if !state.gateway_auth_error.is_empty() {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![Span::styled(
+                format!("  \u{26a0} {}", state.gateway_auth_error),
+                Style::default().fg(theme::YELLOW),
+            )])),
+            chunks[4],
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled(
+            "  [\u{2191}\u{2193}] Navigate  [Enter] Confirm  [Esc] Back",
             theme::hint_style(),
         )])),
         chunks[5],
