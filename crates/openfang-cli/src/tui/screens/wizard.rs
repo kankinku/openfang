@@ -100,7 +100,6 @@ pub fn needs_setup() -> bool {
 pub enum WizardStep {
     Provider,
     ApiKey,
-    GatewayAuth,
     Model,
     Saving,
     Done,
@@ -114,6 +113,12 @@ enum GatewayAuthMode {
     TrustedProxy,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApiSetupPhase {
+    ProviderKey,
+    GatewayAuth,
+}
+
 pub struct WizardState {
     pub step: WizardStep,
     pub provider_list: ListState,
@@ -121,6 +126,7 @@ pub struct WizardState {
     pub selected_provider: Option<usize>, // index into PROVIDERS
     pub api_key_input: String,
     pub api_key_from_env: bool,
+    api_setup_phase: ApiSetupPhase,
     gateway_auth_list: ListState,
     gateway_auth_mode: GatewayAuthMode,
     gateway_auth_secret_input: String,
@@ -139,6 +145,7 @@ impl WizardState {
             selected_provider: None,
             api_key_input: String::new(),
             api_key_from_env: false,
+            api_setup_phase: ApiSetupPhase::ProviderKey,
             gateway_auth_list: ListState::default(),
             gateway_auth_mode: GatewayAuthMode::Token,
             gateway_auth_secret_input: String::new(),
@@ -158,6 +165,7 @@ impl WizardState {
         self.selected_provider = None;
         self.api_key_input.clear();
         self.api_key_from_env = false;
+        self.api_setup_phase = ApiSetupPhase::ProviderKey;
         self.gateway_auth_mode = GatewayAuthMode::Token;
         self.gateway_auth_secret_input.clear();
         self.gateway_auth_error.clear();
@@ -253,7 +261,6 @@ impl WizardState {
         match self.step {
             WizardStep::Provider => self.handle_provider(key),
             WizardStep::ApiKey => self.handle_api_key(key),
-            WizardStep::GatewayAuth => self.handle_gateway_auth(key),
             WizardStep::Model => self.handle_model(key),
             WizardStep::Saving | WizardStep::Done => WizardResult::Continue,
         }
@@ -290,14 +297,17 @@ impl WizardState {
                         // No key needed, skip to gateway auth
                         self.api_key_from_env = false;
                         self.model_input = p.default_model.to_string();
-                        self.step = WizardStep::GatewayAuth;
+                        self.api_setup_phase = ApiSetupPhase::GatewayAuth;
+                        self.step = WizardStep::ApiKey;
                     } else if std::env::var(p.env_var).is_ok() {
                         // Key already in env
                         self.api_key_from_env = true;
                         self.model_input = p.default_model.to_string();
-                        self.step = WizardStep::GatewayAuth;
+                        self.api_setup_phase = ApiSetupPhase::GatewayAuth;
+                        self.step = WizardStep::ApiKey;
                     } else {
                         self.api_key_from_env = false;
+                        self.api_setup_phase = ApiSetupPhase::ProviderKey;
                         self.api_key_input.clear();
                         self.step = WizardStep::ApiKey;
                     }
@@ -309,27 +319,76 @@ impl WizardState {
     }
 
     fn handle_api_key(&mut self, key: KeyEvent) -> WizardResult {
-        match key.code {
-            KeyCode::Esc => {
-                self.step = WizardStep::Provider;
-            }
-            KeyCode::Enter => {
-                if !self.api_key_input.is_empty() {
-                    if let Some(p) = self.selected_provider_info() {
-                        let _ = crate::dotenv::save_env_key(p.env_var, &self.api_key_input);
-                        std::env::set_var(p.env_var, &self.api_key_input);
-                        self.model_input = p.default_model.to_string();
-                    }
-                    self.step = WizardStep::GatewayAuth;
+        match self.api_setup_phase {
+            ApiSetupPhase::ProviderKey => match key.code {
+                KeyCode::Esc => {
+                    self.step = WizardStep::Provider;
                 }
-            }
-            KeyCode::Char(c) => {
-                self.api_key_input.push(c);
-            }
-            KeyCode::Backspace => {
-                self.api_key_input.pop();
-            }
-            _ => {}
+                KeyCode::Enter => {
+                    if !self.api_key_input.is_empty() {
+                        if let Some(p) = self.selected_provider_info() {
+                            let _ = crate::dotenv::save_env_key(p.env_var, &self.api_key_input);
+                            std::env::set_var(p.env_var, &self.api_key_input);
+                            self.model_input = p.default_model.to_string();
+                        }
+                        self.api_setup_phase = ApiSetupPhase::GatewayAuth;
+                    }
+                }
+                KeyCode::Char(c) => {
+                    self.api_key_input.push(c);
+                }
+                KeyCode::Backspace => {
+                    self.api_key_input.pop();
+                }
+                _ => {}
+            },
+            ApiSetupPhase::GatewayAuth => match key.code {
+                KeyCode::Esc => {
+                    if let Some(p) = self.selected_provider_info() {
+                        if p.needs_key && !self.api_key_from_env {
+                            self.api_setup_phase = ApiSetupPhase::ProviderKey;
+                        } else {
+                            self.step = WizardStep::Provider;
+                        }
+                    } else {
+                        self.step = WizardStep::Provider;
+                    }
+                }
+                KeyCode::Up => {
+                    let i = self.gateway_auth_list.selected().unwrap_or(0);
+                    let next = if i == 0 { 3 } else { i - 1 };
+                    self.gateway_auth_list.select(Some(next));
+                    self.gateway_auth_error.clear();
+                }
+                KeyCode::Down => {
+                    let i = self.gateway_auth_list.selected().unwrap_or(0);
+                    let next = (i + 1) % 4;
+                    self.gateway_auth_list.select(Some(next));
+                    self.gateway_auth_error.clear();
+                }
+                KeyCode::Enter => match self.persist_gateway_auth_secret() {
+                    Ok(()) => {
+                        self.gateway_auth_error.clear();
+                        self.step = WizardStep::Model;
+                    }
+                    Err(e) => {
+                        self.gateway_auth_error = e;
+                    }
+                },
+                KeyCode::Char(c) => {
+                    if self.gateway_auth_needs_secret() {
+                        self.gateway_auth_secret_input.push(c);
+                        self.gateway_auth_error.clear();
+                    }
+                }
+                KeyCode::Backspace => {
+                    if self.gateway_auth_needs_secret() {
+                        self.gateway_auth_secret_input.pop();
+                        self.gateway_auth_error.clear();
+                    }
+                }
+                _ => {}
+            },
         }
         WizardResult::Continue
     }
@@ -337,7 +396,8 @@ impl WizardState {
     fn handle_model(&mut self, key: KeyEvent) -> WizardResult {
         match key.code {
             KeyCode::Esc => {
-                self.step = WizardStep::GatewayAuth;
+                self.step = WizardStep::ApiKey;
+                self.api_setup_phase = ApiSetupPhase::GatewayAuth;
             }
             KeyCode::Enter => {
                 self.step = WizardStep::Saving;
@@ -348,57 +408,6 @@ impl WizardState {
             }
             KeyCode::Backspace => {
                 self.model_input.pop();
-            }
-            _ => {}
-        }
-        WizardResult::Continue
-    }
-
-    fn handle_gateway_auth(&mut self, key: KeyEvent) -> WizardResult {
-        match key.code {
-            KeyCode::Esc => {
-                if let Some(p) = self.selected_provider_info() {
-                    if p.needs_key && !self.api_key_from_env {
-                        self.step = WizardStep::ApiKey;
-                    } else {
-                        self.step = WizardStep::Provider;
-                    }
-                } else {
-                    self.step = WizardStep::Provider;
-                }
-            }
-            KeyCode::Up => {
-                let i = self.gateway_auth_list.selected().unwrap_or(0);
-                let next = if i == 0 { 3 } else { i - 1 };
-                self.gateway_auth_list.select(Some(next));
-                self.gateway_auth_error.clear();
-            }
-            KeyCode::Down => {
-                let i = self.gateway_auth_list.selected().unwrap_or(0);
-                let next = (i + 1) % 4;
-                self.gateway_auth_list.select(Some(next));
-                self.gateway_auth_error.clear();
-            }
-            KeyCode::Enter => match self.persist_gateway_auth_secret() {
-                Ok(()) => {
-                    self.gateway_auth_error.clear();
-                    self.step = WizardStep::Model;
-                }
-                Err(e) => {
-                    self.gateway_auth_error = e;
-                }
-            },
-            KeyCode::Char(c) => {
-                if self.gateway_auth_needs_secret() {
-                    self.gateway_auth_secret_input.push(c);
-                    self.gateway_auth_error.clear();
-                }
-            }
-            KeyCode::Backspace => {
-                if self.gateway_auth_needs_secret() {
-                    self.gateway_auth_secret_input.pop();
-                    self.gateway_auth_error.clear();
-                }
             }
             _ => {}
         }
@@ -505,10 +514,9 @@ pub fn draw(f: &mut Frame, area: Rect, state: &mut WizardState) {
     );
 
     let step_label = match state.step {
-        WizardStep::Provider => "Step 1 of 4",
-        WizardStep::ApiKey => "Step 2 of 4",
-        WizardStep::GatewayAuth => "Step 3 of 4",
-        WizardStep::Model => "Step 4 of 4",
+        WizardStep::Provider => "Step 1 of 3",
+        WizardStep::ApiKey => "Step 2 of 3",
+        WizardStep::Model => "Step 3 of 3",
         WizardStep::Saving => "Saving...",
         WizardStep::Done => "Complete",
     };
@@ -558,7 +566,6 @@ pub fn draw(f: &mut Frame, area: Rect, state: &mut WizardState) {
     match state.step {
         WizardStep::Provider => draw_provider(f, chunks[3], state),
         WizardStep::ApiKey => draw_api_key(f, chunks[3], state),
-        WizardStep::GatewayAuth => draw_gateway_auth(f, chunks[3], state),
         WizardStep::Model => draw_model(f, chunks[3], state),
         WizardStep::Saving | WizardStep::Done => draw_done(f, chunks[3], state),
     }
@@ -613,6 +620,11 @@ fn draw_provider(f: &mut Frame, area: Rect, state: &mut WizardState) {
 }
 
 fn draw_api_key(f: &mut Frame, area: Rect, state: &mut WizardState) {
+    if state.api_setup_phase == ApiSetupPhase::GatewayAuth {
+        draw_gateway_auth(f, area, state);
+        return;
+    }
+
     let p = match state.selected_provider_info() {
         Some(p) => p,
         None => return,

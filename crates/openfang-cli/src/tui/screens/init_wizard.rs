@@ -1,4 +1,4 @@
-//! Standalone ratatui init wizard: onboarding flow with provider + gateway auth.
+//! Standalone ratatui init wizard: onboarding flow (provider/API + gateway auth in one setup step).
 //!
 //! Launched by `openfang init` (without `--quick`). Takes over the terminal,
 //! runs its own event loop, and returns an `InitResult`.
@@ -146,7 +146,6 @@ enum Step {
     Migration,
     Provider,
     ApiKey,
-    GatewayAuth,
     Model,
     Routing,
     Complete,
@@ -183,6 +182,12 @@ enum KeyTestState {
     Testing,
     Ok,
     Warn,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApiSetupPhase {
+    ProviderKey,
+    GatewayAuth,
 }
 
 /// A model entry for list display.
@@ -224,6 +229,7 @@ struct State {
     api_key_from_env: bool,
     key_test: KeyTestState,
     key_test_started: Option<Instant>,
+    api_setup_phase: ApiSetupPhase,
 
     // Gateway auth
     gateway_auth_list: ListState,
@@ -274,6 +280,7 @@ impl State {
             api_key_from_env: false,
             key_test: KeyTestState::Idle,
             key_test_started: None,
+            api_setup_phase: ApiSetupPhase::ProviderKey,
             gateway_auth_list: ListState::default(),
             gateway_auth_mode: GatewayAuthMode::Token,
             gateway_auth_secret_input: String::new(),
@@ -382,14 +389,13 @@ impl State {
 
     fn step_label(&self) -> &'static str {
         match self.step {
-            Step::Welcome => "1 of 8",
-            Step::Migration => "2 of 8",
-            Step::Provider => "3 of 8",
-            Step::ApiKey => "4 of 8",
-            Step::GatewayAuth => "5 of 8",
-            Step::Model => "6 of 8",
-            Step::Routing => "7 of 8",
-            Step::Complete => "8 of 8",
+            Step::Welcome => "1 of 7",
+            Step::Migration => "2 of 7",
+            Step::Provider => "3 of 7",
+            Step::ApiKey => "4 of 7",
+            Step::Model => "5 of 7",
+            Step::Routing => "6 of 7",
+            Step::Complete => "7 of 7",
         }
     }
 
@@ -578,7 +584,8 @@ pub fn run() -> InitResult {
                 if started.elapsed() >= Duration::from_millis(600) {
                     state.load_models_for_provider();
                     state.gateway_auth_error.clear();
-                    state.step = Step::GatewayAuth;
+                    state.api_setup_phase = ApiSetupPhase::GatewayAuth;
+                    state.step = Step::ApiKey;
                     state.key_test = KeyTestState::Idle;
                     state.key_test_started = None;
                 }
@@ -699,15 +706,18 @@ pub fn run() -> InitResult {
                                     state.api_key_from_env = false;
                                     state.load_models_for_provider();
                                     state.gateway_auth_error.clear();
-                                    state.step = Step::GatewayAuth;
+                                    state.api_setup_phase = ApiSetupPhase::GatewayAuth;
+                                    state.step = Step::ApiKey;
                                 } else if state.is_provider_detected(prov_idx) {
                                     state.api_key_from_env = true;
                                     state.load_models_for_provider();
                                     state.gateway_auth_error.clear();
-                                    state.step = Step::GatewayAuth;
+                                    state.api_setup_phase = ApiSetupPhase::GatewayAuth;
+                                    state.step = Step::ApiKey;
                                 } else {
                                     state.api_key_from_env = false;
                                     state.api_key_input.clear();
+                                    state.api_setup_phase = ApiSetupPhase::ProviderKey;
                                     state.key_test = KeyTestState::Idle;
                                     state.step = Step::ApiKey;
                                 }
@@ -717,108 +727,111 @@ pub fn run() -> InitResult {
                     },
 
                     Step::ApiKey => {
-                        if matches!(state.key_test, KeyTestState::Ok | KeyTestState::Warn) {
-                            continue;
-                        }
-
-                        match key.code {
-                            KeyCode::Esc => {
-                                state.key_test = KeyTestState::Idle;
-                                state.step = Step::Provider;
-                            }
-                            KeyCode::Enter => {
-                                if !state.api_key_input.is_empty()
-                                    && state.key_test == KeyTestState::Idle
-                                {
-                                    if let Some(p) = state.provider() {
-                                        let _ = crate::dotenv::save_env_key(
-                                            p.env_var,
-                                            &state.api_key_input,
-                                        );
+                        match state.api_setup_phase {
+                            ApiSetupPhase::ProviderKey => {
+                                if matches!(state.key_test, KeyTestState::Ok | KeyTestState::Warn) {
+                                    continue;
+                                }
+                                match key.code {
+                                    KeyCode::Esc => {
+                                        state.key_test = KeyTestState::Idle;
+                                        state.step = Step::Provider;
                                     }
-                                    state.key_test = KeyTestState::Testing;
-                                    let provider_name = state
-                                        .provider()
-                                        .map(|p| p.name.to_string())
-                                        .unwrap_or_default();
-                                    let env_var = state
-                                        .provider()
-                                        .map(|p| p.env_var.to_string())
-                                        .unwrap_or_default();
-                                    let tx = test_tx.clone();
-                                    std::thread::spawn(move || {
-                                        let ok = crate::test_api_key(&provider_name, &env_var);
-                                        let _ = tx.send(ok);
-                                    });
+                                    KeyCode::Enter => {
+                                        if !state.api_key_input.is_empty()
+                                            && state.key_test == KeyTestState::Idle
+                                        {
+                                            if let Some(p) = state.provider() {
+                                                let _ = crate::dotenv::save_env_key(
+                                                    p.env_var,
+                                                    &state.api_key_input,
+                                                );
+                                            }
+                                            state.key_test = KeyTestState::Testing;
+                                            let provider_name = state
+                                                .provider()
+                                                .map(|p| p.name.to_string())
+                                                .unwrap_or_default();
+                                            let env_var = state
+                                                .provider()
+                                                .map(|p| p.env_var.to_string())
+                                                .unwrap_or_default();
+                                            let tx = test_tx.clone();
+                                            std::thread::spawn(move || {
+                                                let ok = crate::test_api_key(&provider_name, &env_var);
+                                                let _ = tx.send(ok);
+                                            });
+                                        }
+                                    }
+                                    KeyCode::Char(c) => {
+                                        if state.key_test == KeyTestState::Idle {
+                                            state.api_key_input.push(c);
+                                        }
+                                    }
+                                    KeyCode::Backspace => {
+                                        if state.key_test == KeyTestState::Idle {
+                                            state.api_key_input.pop();
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
-                            KeyCode::Char(c) => {
-                                if state.key_test == KeyTestState::Idle {
-                                    state.api_key_input.push(c);
+                            ApiSetupPhase::GatewayAuth => match key.code {
+                                KeyCode::Esc => {
+                                    if let Some(p) = state.provider() {
+                                        if p.needs_key && !state.api_key_from_env {
+                                            state.api_setup_phase = ApiSetupPhase::ProviderKey;
+                                        } else {
+                                            state.step = Step::Provider;
+                                        }
+                                    } else {
+                                        state.step = Step::Provider;
+                                    }
                                 }
-                            }
-                            KeyCode::Backspace => {
-                                if state.key_test == KeyTestState::Idle {
-                                    state.api_key_input.pop();
+                                KeyCode::Up => {
+                                    let i = state.gateway_auth_list.selected().unwrap_or(0);
+                                    let next = if i == 0 { 3 } else { i - 1 };
+                                    state.gateway_auth_list.select(Some(next));
+                                    state.gateway_auth_error.clear();
                                 }
-                            }
-                            _ => {}
+                                KeyCode::Down => {
+                                    let i = state.gateway_auth_list.selected().unwrap_or(0);
+                                    let next = (i + 1) % 4;
+                                    state.gateway_auth_list.select(Some(next));
+                                    state.gateway_auth_error.clear();
+                                }
+                                KeyCode::Enter => {
+                                    match state.persist_gateway_auth_secret() {
+                                        Ok(()) => {
+                                            state.gateway_auth_error.clear();
+                                            state.step = Step::Model;
+                                        }
+                                        Err(e) => {
+                                            state.gateway_auth_error = e;
+                                        }
+                                    }
+                                }
+                                KeyCode::Char(c) => {
+                                    if state.gateway_auth_needs_secret() {
+                                        state.gateway_auth_secret_input.push(c);
+                                        state.gateway_auth_error.clear();
+                                    }
+                                }
+                                KeyCode::Backspace => {
+                                    if state.gateway_auth_needs_secret() {
+                                        state.gateway_auth_secret_input.pop();
+                                        state.gateway_auth_error.clear();
+                                    }
+                                }
+                                _ => {}
+                            },
                         }
                     }
 
-                    Step::GatewayAuth => match key.code {
-                        KeyCode::Esc => {
-                            if let Some(p) = state.provider() {
-                                if p.needs_key && !state.api_key_from_env {
-                                    state.step = Step::ApiKey;
-                                } else {
-                                    state.step = Step::Provider;
-                                }
-                            } else {
-                                state.step = Step::Provider;
-                            }
-                        }
-                        KeyCode::Up => {
-                            let i = state.gateway_auth_list.selected().unwrap_or(0);
-                            let next = if i == 0 { 3 } else { i - 1 };
-                            state.gateway_auth_list.select(Some(next));
-                            state.gateway_auth_error.clear();
-                        }
-                        KeyCode::Down => {
-                            let i = state.gateway_auth_list.selected().unwrap_or(0);
-                            let next = (i + 1) % 4;
-                            state.gateway_auth_list.select(Some(next));
-                            state.gateway_auth_error.clear();
-                        }
-                        KeyCode::Enter => {
-                            match state.persist_gateway_auth_secret() {
-                                Ok(()) => {
-                                    state.gateway_auth_error.clear();
-                                    state.step = Step::Model;
-                                }
-                                Err(e) => {
-                                    state.gateway_auth_error = e;
-                                }
-                            }
-                        }
-                        KeyCode::Char(c) => {
-                            if state.gateway_auth_needs_secret() {
-                                state.gateway_auth_secret_input.push(c);
-                                state.gateway_auth_error.clear();
-                            }
-                        }
-                        KeyCode::Backspace => {
-                            if state.gateway_auth_needs_secret() {
-                                state.gateway_auth_secret_input.pop();
-                                state.gateway_auth_error.clear();
-                            }
-                        }
-                        _ => {}
-                    },
-
                     Step::Model => match key.code {
                         KeyCode::Esc => {
-                            state.step = Step::GatewayAuth;
+                            state.step = Step::ApiKey;
+                            state.api_setup_phase = ApiSetupPhase::GatewayAuth;
                         }
                         KeyCode::Up | KeyCode::Char('k') => {
                             let len = state.model_entries.len().max(1);
@@ -1215,7 +1228,7 @@ fn draw(f: &mut Frame, area: Rect, state: &mut State) {
     ])
     .split(content);
 
-    // Header: "OpenFang Init  Step X of 8"
+    // Header: "OpenFang Init  Step X of 7"
     let header = Line::from(vec![
         Span::styled(
             "OpenFang",
@@ -1242,7 +1255,6 @@ fn draw(f: &mut Frame, area: Rect, state: &mut State) {
         Step::Migration => draw_migration(f, chunks[3], state),
         Step::Provider => draw_provider(f, chunks[3], state),
         Step::ApiKey => draw_api_key(f, chunks[3], state),
-        Step::GatewayAuth => draw_gateway_auth(f, chunks[3], state),
         Step::Model => draw_model(f, chunks[3], state),
         Step::Routing => draw_routing(f, chunks[3], state),
         Step::Complete => draw_complete(f, chunks[3], state),
@@ -1767,6 +1779,11 @@ fn draw_provider(f: &mut Frame, area: Rect, state: &mut State) {
 }
 
 fn draw_api_key(f: &mut Frame, area: Rect, state: &mut State) {
+    if state.api_setup_phase == ApiSetupPhase::GatewayAuth {
+        draw_gateway_auth(f, area, state);
+        return;
+    }
+
     let p = match state.provider() {
         Some(p) => p,
         None => return,
